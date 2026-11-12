@@ -455,19 +455,31 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 		}
 	}
 	metaChanged := rec.Title != spec.title || !slices.Equal(rec.Libs, libs)
-	if poster != nil || (!created && metaChanged) {
-		err := s.silo.UpdateCollection(ctx, rec.SiloID, spec.title, libs, poster)
+	gone := func(err error) error {
+		// Deleted in Silo during this run: forget it and rebuild next run.
+		s.state.setCollection(spec.key, nil)
+		return fmt.Errorf("was deleted in Silo; it will be recreated on the next run")
+	}
+	if !created && metaChanged {
+		err := s.silo.UpdateCollection(ctx, rec.SiloID, spec.title, libs)
 		if errors.Is(err, errNotFound) {
-			// Deleted in Silo during this run: forget it and rebuild next run.
-			s.state.setCollection(spec.key, nil)
-			return fmt.Errorf("was deleted in Silo; it will be recreated on the next run")
+			return gone(err)
 		}
 		if err != nil {
 			return err
 		}
 	}
 	if poster != nil {
-		rec.Thumb = winner.Thumb
+		err := s.silo.SetCollectionPoster(ctx, rec.SiloID, poster)
+		switch {
+		case errors.Is(err, errNotFound):
+			return gone(err)
+		case err != nil:
+			s.addError("collection %q poster: %v", spec.title, err)
+			poster = nil
+		default:
+			rec.Thumb = winner.Thumb
+		}
 	}
 	rec.Title, rec.Libs, rec.Sections = spec.title, libs, spec.sectionIDs()
 
@@ -480,13 +492,16 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 		members[m] = true
 	}
 	renamed := map[string]string{} // desired ID -> the ID it was added under
+	outside := 0                   // titles Silo has, but not in this collection's libraries
 	for _, id := range added {
 		orig := id
 		err := s.silo.AddCollectionItem(ctx, rec.SiloID, id, position[id])
 		if err != nil && !errors.Is(err, errRateLimited) {
 			// Silo refuses an ID that stopped existing after the lookup (it
-			// re-keys titles it matches better), answering 404 or 500. Look
-			// the title up again and add it under its current ID.
+			// re-keys titles it matches better), answering 404. Look the
+			// title up again and add it under its current ID. A 404 that
+			// survives that means the title isn't in any of the collection's
+			// Silo libraries.
 			current, gone, lerr := s.currentID(ctx, refs[id])
 			switch {
 			case gone:
@@ -497,6 +512,7 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 					renamed[orig] = current
 				}
 			case errors.Is(err, errNotFound):
+				outside++
 				continue
 			}
 		}
@@ -505,6 +521,9 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 			continue
 		}
 		members[id] = true
+	}
+	if outside > 0 {
+		s.log("collection titles skipped: not in the collection's Silo libraries", "collection", spec.title, "titles", outside)
 	}
 	for _, id := range removed {
 		if err := s.silo.RemoveCollectionItem(ctx, rec.SiloID, id); err != nil {
@@ -532,9 +551,15 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 	}
 	reordered := false
 	if len(order) > 1 && (created || adopted || !slices.Equal(order, rec.Order)) {
-		if err := s.applyOrder(ctx, rec.SiloID, order); err != nil {
+		err := s.silo.ReorderCollection(ctx, rec.SiloID, order)
+		switch {
+		case errors.Is(err, errOrderTooLarge):
+			// Silo can't reorder more than 200 titles at once; the titles
+			// keep the positions they were added at.
+			s.log("collection order left as added: over 200 titles", "collection", spec.title)
+		case err != nil:
 			s.addError("collection %q order: %v", spec.title, err)
-		} else {
+		default:
 			rec.Order = order
 			reordered = !created
 		}
@@ -551,23 +576,6 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 		s.summary.CollectionsUpdated++
 	}
 	s.mu.Unlock()
-	return nil
-}
-
-// applyOrder sets a collection's order in one call. Silo only accepts that
-// when the list names every item it holds; if the collection has items this
-// plugin doesn't know about, each title's position is set one by one instead,
-// which Silo also allows (adding an existing item updates its position).
-func (s *syncer) applyOrder(ctx context.Context, collectionID string, order []string) error {
-	err := s.silo.ReorderCollection(ctx, collectionID, order)
-	if err == nil || !errors.Is(err, errBadRequest) {
-		return err
-	}
-	for i, id := range order {
-		if err := s.silo.AddCollectionItem(ctx, collectionID, id, i); err != nil && !errors.Is(err, errNotFound) {
-			return err
-		}
-	}
 	return nil
 }
 

@@ -106,7 +106,7 @@ func (p *plugin) runReset(ctx context.Context, ids map[string]bool) (*runSummary
 		if host == nil {
 			return errors.New("Silo host connection is not ready yet; try again in a moment")
 		}
-		base, _, err := resolveRelayBase(ctx, host, cfg.SiloInternalURL)
+		base, err := resolveSiloBase(ctx, host, cfg.SiloInternalURL)
 		if err != nil {
 			return err
 		}

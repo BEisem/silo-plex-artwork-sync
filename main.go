@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -34,8 +33,7 @@ var version = ""
 const maxRunTime = 2 * time.Hour
 
 type plugin struct {
-	log   hclog.Logger
-	relay *imageRelay
+	log hclog.Logger
 
 	mu      sync.Mutex
 	cfg     Config
@@ -56,9 +54,8 @@ type plugin struct {
 
 func main() {
 	p := &plugin{
-		log:   hclog.New(&hclog.LoggerOptions{Name: "plex-artwork-sync", Output: os.Stderr, JSONFormat: true}),
-		relay: newImageRelay(),
-		cfg:   defaultConfig(),
+		log: hclog.New(&hclog.LoggerOptions{Name: "plex-artwork-sync", Output: os.Stderr, JSONFormat: true}),
+		cfg: defaultConfig(),
 	}
 	sdkruntime.ServeManifestWithOptions(manifestJSON, version, sdkruntime.CapabilityServers{
 		ScheduledTask: &taskServer{p: p},
@@ -78,6 +75,7 @@ func (p *plugin) configure(_ context.Context, entries []*pluginv1.ConfigEntry) e
 	}
 	// Resume a webhook-requested run that a restart interrupted.
 	go p.resumePending()
+	p.startHeartbeat()
 	return nil
 }
 
@@ -222,7 +220,7 @@ func (p *plugin) doSync(ctx context.Context, cfg Config, summary *runSummary) er
 	if host == nil {
 		return errors.New("Silo host connection is not ready yet; try again in a moment")
 	}
-	base, installationID, err := resolveRelayBase(ctx, host, cfg.SiloInternalURL)
+	base, err := resolveSiloBase(ctx, host, cfg.SiloInternalURL)
 	if err != nil {
 		return err
 	}
@@ -254,8 +252,6 @@ func (p *plugin) doSync(ctx context.Context, cfg Config, summary *runSummary) er
 		catalog:       host,
 		plex:          newPlexClient(cfg.PlexURL, cfg.PlexToken),
 		silo:          newSiloClient(base, cfg.SiloAPIKey),
-		relay:         p.relay,
-		relayURL:      fmt.Sprintf("%s/api/v1/plugins/%d/img/", base, installationID),
 		state:         state,
 		log:           p.logf,
 		summary:       summary,
@@ -318,8 +314,6 @@ func (r *routesServer) Handle(_ context.Context, req *pluginv1.HandleHTTPRequest
 	switch {
 	case req.GetMethod() == http.MethodPost && path == "/kometa":
 		return r.webhook(req), nil
-	case req.GetMethod() == http.MethodGet && strings.HasPrefix(path, "/img/"):
-		return r.image(strings.TrimPrefix(path, "/img/")), nil
 	case req.GetMethod() == http.MethodGet && strings.HasPrefix(path, "/assets/"):
 		return serveAsset(strings.TrimPrefix(path, "/assets/")), nil
 	case req.GetMethod() == http.MethodPost && path == "/libraries":
@@ -363,18 +357,6 @@ func (r *routesServer) webhook(req *pluginv1.HandleHTTPRequest) *pluginv1.Handle
 	due := r.p.requestRun()
 	r.p.log.Info("Kometa run_end received; sync scheduled", "due", due)
 	return jsonResponse(http.StatusAccepted, map[string]any{"scheduled_for": due.UTC().Format(time.RFC3339)})
-}
-
-func (r *routesServer) image(nonce string) *pluginv1.HandleHTTPResponse {
-	entry, ok := r.p.relay.get(nonce)
-	if !ok {
-		return textResponse(http.StatusNotFound, "not found")
-	}
-	return &pluginv1.HandleHTTPResponse{
-		StatusCode: http.StatusOK,
-		Headers:    map[string]string{"Content-Type": entry.contentType, "Cache-Control": "no-store"},
-		Body:       entry.data,
-	}
 }
 
 type checkResult struct {
@@ -444,42 +426,14 @@ func (p *plugin) connectionCheck(ctx context.Context, cfg Config) []checkResult 
 		add("Silo", errors.New("Silo host connection is not ready yet; reload in a moment"), "")
 		return out
 	}
-	base, installationID, err := resolveRelayBase(ctx, host, cfg.SiloInternalURL)
+	base, err := resolveSiloBase(ctx, host, cfg.SiloInternalURL)
 	if !add("Silo internal URL", err, "") {
 		return out
 	}
 	out[len(out)-1].Detail = base
 
 	silo := newSiloClient(base, cfg.SiloAPIKey)
-	add("Silo admin API key", silo.Ping(ctx), "Accepted for admin routes.")
-
-	// Prove Silo can fetch posters from this plugin: serve a test payload on
-	// the relay route and fetch it through Silo's own plugin proxy.
-	nonce, err := p.relay.put([]byte("kometa-sync relay check"))
-	if add("Poster relay", err, "") {
-		defer p.relay.drop(nonce)
-		relayURL := fmt.Sprintf("%s/api/v1/plugins/%d/img/%s", base, installationID, nonce)
-		err := func() error {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, relayURL, nil)
-			if err != nil {
-				return err
-			}
-			resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-			if err != nil {
-				return fmt.Errorf("could not reach %s: %w", base, err)
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			if resp.StatusCode != http.StatusOK || string(body) != "kometa-sync relay check" {
-				return fmt.Errorf("Silo answered HTTP %d for the relay route; posters can't be handed to Silo", resp.StatusCode)
-			}
-			return nil
-		}()
-		out[len(out)-1] = checkResult{Name: "Poster relay", OK: err == nil, Detail: "Silo can fetch posters from this plugin."}
-		if err != nil {
-			out[len(out)-1].Detail = err.Error()
-		}
-	}
+	add("Silo admin API key", silo.Ping(ctx), "Accepted for Silo's admin API (v2).")
 	return out
 }
 
@@ -492,13 +446,11 @@ func (r *routesServer) status(req *pluginv1.HandleHTTPRequest) *pluginv1.HandleH
 	last := p.lastRun
 	p.mu.Unlock()
 
-	webhook := "http://SILO_HOST/api/v1/plugins/INSTALLATION_ID/kometa?secret=YOUR_WEBHOOK_SECRET"
+	webhook := "http://SILO_HOST" + defaultPluginContentPrefix + "/plugins/INSTALLATION_ID/kometa?secret=YOUR_WEBHOOK_SECRET"
 	if host := sdkruntime.Host(); host != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if info, err := host.GetHostInfo(ctx); err == nil && info.PluginProxyBaseURL != "" {
-			webhook = info.PluginProxyBaseURL + "/kometa?secret=YOUR_WEBHOOK_SECRET"
-		} else if _, id, err := resolveRelayBase(ctx, host, "http://placeholder"); err == nil {
-			webhook = fmt.Sprintf("http://SILO_HOST/api/v1/plugins/%d/kometa?secret=YOUR_WEBHOOK_SECRET", id)
+		if base, err := pluginBaseURL(ctx, host); err == nil {
+			webhook = base + "/kometa?secret=YOUR_WEBHOOK_SECRET"
 		}
 		cancel()
 	}

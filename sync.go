@@ -33,8 +33,6 @@ type syncer struct {
 	catalog  presenceLookup
 	plex     *PlexClient
 	silo     *SiloClient
-	relay    *imageRelay
-	relayURL string // .../api/v1/plugins/<installation>/img/
 	state    *stateStore
 	progress *syncProgress // nil-safe
 
@@ -65,36 +63,45 @@ func (s *syncer) addError(format string, args ...any) {
 	s.log("sync error", "error", fmt.Sprintf(format, args...))
 }
 
-// resolveRelayBase works out the loopback URL Silo should use to fetch
-// relayed posters from this plugin's /img route.
-func resolveRelayBase(ctx context.Context, host *runtimehost.Client, override string) (string, int, error) {
-	installationID := 0
-	plugins, err := host.ListInstalledPlugins(ctx)
-	if err != nil {
-		return "", 0, fmt.Errorf("list installed plugins: %w", err)
-	}
-	for _, p := range plugins {
-		if p.GetPluginId() == pluginID && p.GetEnabled() {
-			installationID = int(p.GetInstallationId())
-			break
-		}
-	}
-	if installationID == 0 {
-		return "", 0, errors.New("could not find this plugin's installation id")
-	}
-
+// resolveSiloBase works out the loopback URL the plugin calls Silo's REST
+// API on.
+func resolveSiloBase(ctx context.Context, host *runtimehost.Client, override string) (string, error) {
 	base := strings.TrimRight(override, "/")
 	if base == "" {
 		info, err := host.GetHostInfo(ctx)
 		if err != nil {
-			return "", 0, fmt.Errorf("get host info: %w", err)
+			return "", fmt.Errorf("get host info: %w", err)
 		}
 		base = normalizeLoopback(info.InternalBaseURL)
 	}
 	if base == "" {
-		return "", 0, errors.New("Silo did not report its internal URL; set \"Silo internal URL\" in the plugin settings")
+		return "", errors.New("Silo did not report its internal URL; set \"Silo internal URL\" in the plugin settings")
 	}
-	return base, installationID, nil
+	return base, nil
+}
+
+// defaultPluginContentPrefix is where Silo serves plugin HTTP routes. Silo
+// reports the full address (PluginProxyBaseUrl) when it knows its public URL;
+// this is only the fallback for building a placeholder when it doesn't.
+const defaultPluginContentPrefix = "/api/v2/plugin-content"
+
+// pluginBaseURL is the address of this plugin's own HTTP routes, e.g.
+// https://silo.example.com/api/v2/plugin-content/plugins/12. Without a public
+// URL configured in Silo, the host part is the placeholder SILO_HOST.
+func pluginBaseURL(ctx context.Context, host *runtimehost.Client) (string, error) {
+	if info, err := host.GetHostInfo(ctx); err == nil && info.PluginProxyBaseURL != "" {
+		return strings.TrimRight(info.PluginProxyBaseURL, "/"), nil
+	}
+	plugins, err := host.ListInstalledPlugins(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list installed plugins: %w", err)
+	}
+	for _, p := range plugins {
+		if p.GetPluginId() == pluginID && p.GetEnabled() {
+			return fmt.Sprintf("http://SILO_HOST%s/plugins/%d", defaultPluginContentPrefix, p.GetInstallationId()), nil
+		}
+	}
+	return "", errors.New("could not find this plugin's installation id")
 }
 
 // normalizeLoopback rewrites wildcard listen addresses (":8080",
@@ -549,12 +556,7 @@ func (s *syncer) applyPoster(ctx context.Context, j posterJob) error {
 	if err != nil {
 		return err
 	}
-	nonce, err := s.relay.put(data)
-	if err != nil {
-		return err
-	}
-	defer s.relay.drop(nonce)
-	return s.silo.ApplyPoster(ctx, j.contentID, s.relayURL+nonce)
+	return s.silo.UploadPoster(ctx, j.contentID, data)
 }
 
 func sectionID(sec plexSection) string {

@@ -144,7 +144,7 @@ input[type=radio]{width:1rem;height:1rem;accent-color:var(--primary);margin:0}
 (function(){
   function lum(h){var v=parseInt(h.slice(1),16);function c(s){var x=((v>>s)&255)/255;return x<=.04045?x/12.92:Math.pow((x+.055)/1.055,2.4)}
     return .2126*c(16)+.7152*c(8)+.0722*c(0)}
-  fetch("/api/v1/theme/branding",{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null}).then(function(b){
+  fetch("/api/v2/theme/branding",{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null}).then(function(b){
     var m=b&&/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((b.accent_color||"").trim()); if(!m)return;
     var d=m[1].toLowerCase(); if(d.length===3)d=d.split("").map(function(x){return x+x}).join(""); var hex="#"+d;
     var s=document.documentElement.style; s.setProperty("--primary",hex); s.setProperty("--ring",hex);
@@ -332,7 +332,7 @@ var statusPage = template.Must(template.New("status").Funcs(template.FuncMap{"nu
 
 <section class="card">
   <div class="cardhead"><div><h2>Connection check</h2>
-    <p class="desc">Tests Plex, Kometa's Overlay label (when that setting is on), the API key and whether Silo can fetch posters from this plugin. Nothing is written.</p></div>
+    <p class="desc">Tests Plex, Kometa's Overlay label (when that setting is on) and the Silo API key. Nothing is written.</p></div>
     <a class="btn btn-outline btn-sm" href="?check=1">{{if .Checks}}Run again{{else}}Run check{{end}}</a></div>
   {{if .Checks}}<div class="checks">{{range .Checks}}
     <div class="icon"><span class="check {{if .OK}}ok{{else}}bad{{end}}">{{if .OK}}&#10003;{{else}}&#10005;{{end}}</span></div>

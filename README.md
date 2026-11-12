@@ -25,11 +25,11 @@ The plugin copies from Plex, so it does nothing on its own. You need:
 
 1. A sync starts when Kometa's `run_end` webhook arrives (after a configurable delay, default 5 minutes), when Silo's scheduled task runs, or when you click Run now. Several webhooks in a row collapse into one run.
 2. For each selected Plex movie/TV library, it lists the items to sync: by default those carrying Kometa's `Overlay` label, or every item if you turn that setting off. Each Plex poster path ends in an upload timestamp, so only posters that changed since the last sync are sent.
-3. Items are matched to Silo by TMDB id. Each poster is handed to Silo's own "apply image" endpoint, which locks the item's artwork so a Silo metadata refresh won't replace it.
+3. Items are matched to Silo by TMDB id. Each poster is uploaded to Silo as an image file, the same as uploading one by hand in Silo's artwork picker, which locks the item's artwork so a Silo metadata refresh won't replace it.
 4. Plex collections are mirrored as manual Silo collections. The plugin only edits or deletes collections it created.
 5. If Kometa removes an item's overlay, the clean Plex poster is pushed to Silo once.
 
-Posters are relayed through the plugin's own short-lived `/img/<random>` route rather than handing Silo a Plex URL. Silo stores the source URL of every applied image, so this keeps your Plex token out of Silo's database.
+The plugin downloads each poster from Plex itself and uploads the image, so Silo never sees a Plex URL and your Plex token stays out of Silo's database.
 
 ## Install
 
@@ -41,11 +41,13 @@ Posters are relayed through the plugin's own short-lived `/img/<random>` route r
    - **Silo admin API key**.
    - **Webhook secret**: any long random string.
    - **Only posters Kometa has overlaid**: leave on if you use Kometa; turn off to sync every poster.
-4. Open the plugin's **Plex Artwork Sync** status page. Tick the Plex libraries to sync under **Libraries** and click Save (nothing ticked pauses syncing; libraries added to Plex later start unticked). Then click **Run check**. It tests Plex, the Overlay label (when that setting is on), the API key and whether Silo can fetch posters from the plugin. (Silo's own "Check connection" button only works for metadata and marker plugins.)
+4. Open the plugin's **Plex Artwork Sync** status page. Tick the Plex libraries to sync under **Libraries** and click Save (nothing ticked pauses syncing; libraries added to Plex later start unticked). Then click **Run check**. It tests Plex, the Overlay label (when that setting is on), and the Silo API key. (Silo's own "Check connection" button only works for metadata and marker plugins.)
 5. Choose what starts a sync: the Kometa webhook (next section), a schedule on the task (see [The scheduled task](#the-scheduled-task)), or both.
 6. Turn on **Dry run** for the first run if you want to see what it would change. The summary appears on the status page.
 
-Upgrading from Kometa Poster Sync: upload the new binary over the old one. It's the same plugin underneath, so your settings, library choices and collections carry over.
+Upgrading from an earlier version: upload the new binary over the old one. Your settings, library choices and collections carry over.
+
+**Requires a Silo build from November 11, 2026 or later** (Silo's `/api/v2`). Version 0.4.0 and earlier use Silo's retired `/api/v1` and stop working on current Silo. If your Kometa webhook URL still contains `/api/v1/plugins/`, replace it with the URL the status page shows (`/api/v2/plugin-content/plugins/…`).
 
 ### The Kometa webhook
 
@@ -112,6 +114,8 @@ The plugin registers a **Plex Artwork Sync** task in Silo's scheduled tasks. Tha
 
 Without Kometa, the schedule is what keeps Silo current: set the task to run daily or every few hours. With the Kometa webhook, a daily schedule is an optional safety net.
 
+Silo stops a plugin that has been idle for 30 minutes. While a sync is running or waiting to start, the plugin checks in with Silo every few minutes so it isn't stopped partway through; once there's nothing to do, it lets Silo stop it as usual. Silo starts it again on the next webhook, scheduled run or status-page visit.
+
 ## Reverting
 
 Silo has no bulk "reset artwork" action, and the image lock it sets when a poster is applied makes library refreshes skip those items. The status page's **Revert** section handles it per library:
@@ -138,7 +142,9 @@ make test
 - Items Plex has no TMDB id for are skipped and counted under "No TMDB id".
 - Plex "composite" collection posters (the auto collage) aren't copied. Silo builds its own.
 - A collection whose items aren't in Silo yet is skipped until they are.
-- Posters over ~3.8 MB are re-encoded to JPEG for the relay.
+- Posters over 10 MB (Silo's upload limit) are re-encoded to JPEG first.
+- Silo reorders at most 200 titles in a collection at once. A larger collection keeps titles in the order they were first added.
+- Silo won't delete a collection that a Home or library page row still shows. The plugin reports that as an error until you remove it from the row.
 
 ## License
 

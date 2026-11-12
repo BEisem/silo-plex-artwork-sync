@@ -1,6 +1,6 @@
 {
   "plugin_id": "community.kometa-sync",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "category": "Artwork",
@@ -32,8 +32,8 @@
     {
       "type": "http_routes.v1",
       "id": "routes",
-      "display_name": "Webhook and poster relay",
-      "description": "Receives Kometa's run_end webhook, serves the status page, and hands posters to Silo during a sync."
+      "display_name": "Webhook and status page",
+      "description": "Receives Kometa's run_end webhook and serves the status page."
     }
   ],
   "http_routes": [
@@ -41,12 +41,6 @@
       "id": "kometa-webhook",
       "method": "POST",
       "path": "/kometa",
-      "access": "public"
-    },
-    {
-      "id": "image",
-      "method": "GET",
-      "path": "/img/*",
       "access": "public"
     },
     {

@@ -208,14 +208,14 @@ func (r *reverter) revertItem(ctx context.Context, contentID string) error {
 	waitCtx, cancel := context.WithTimeout(ctx, jobWaitTimeout)
 	defer cancel()
 	for {
-		status, msg, err := r.silo.JobStatus(waitCtx, jobID)
+		status, terminal, msg, err := r.silo.JobStatus(waitCtx, jobID)
 		if err != nil {
 			return fmt.Errorf("refresh job %s: %w", jobID, err)
 		}
-		switch status {
-		case "completed":
-			return nil
-		case "failed", "cancelled":
+		if terminal {
+			if status == "succeeded" {
+				return nil
+			}
 			return fmt.Errorf("Silo refresh job %s: %s %s", jobID, status, msg)
 		}
 		select {

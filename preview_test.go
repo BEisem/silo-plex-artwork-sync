@@ -17,7 +17,7 @@ func TestWritePreview(t *testing.T) {
 	}
 	var b strings.Builder
 	err := statusPage.Execute(&b, map[string]any{
-		"WebhookURL": "http://silo:8080/api/v1/plugins/12/kometa?secret=YOUR_WEBHOOK_SECRET",
+		"WebhookURL": "http://silo:8080/api/v2/plugin-content/plugins/12/kometa?secret=YOUR_WEBHOOK_SECRET",
 		"FormToken":  "tok", "Running": true, "Mode": "sync",
 		"Progress": progressView{Running: true, Mode: "sync", Phase: "Applying posters", Done: 412, Total: 971, Started: "2026-10-24T10:58:03Z"},
 		"Libraries": &libraryView{Winner: "highest", CollMode: "combined", Positions: []int{1, 2, 3, 4}, Options: []libraryOption{

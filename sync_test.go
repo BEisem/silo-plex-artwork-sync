@@ -5,15 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
 	"math/rand/v2"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -168,6 +172,9 @@ type fakeSilo struct {
 	goneIDs   map[string]bool // content IDs Silo answers 404 for
 	fkGone    map[string]bool // content IDs a collection add rejects with 500
 	collPos   map[string]map[string]int
+	collRev   map[string]int
+	staleOnce bool            // change the collection right after its next ETag read
+	inUse     map[string]bool // collections a page row still shows (delete is 409)
 	reorders  int
 	refreshed []string
 	jobPolls  map[string]int
@@ -200,70 +207,124 @@ func (f *fakeSilo) ordered(collection string) []string {
 	return ids
 }
 
+func (f *fakeSilo) etag(id string) string {
+	if f.collRev == nil {
+		f.collRev = map[string]int{}
+	}
+	return fmt.Sprintf(`"r%d"`, f.collRev[id])
+}
+
+func (f *fakeSilo) bump(id string) {
+	if f.collRev == nil {
+		f.collRev = map[string]int{}
+	}
+	f.collRev[id]++
+}
+
+func stringIDs(ids []int) []string {
+	out := []string{}
+	for _, id := range ids {
+		out = append(out, strconv.Itoa(id))
+	}
+	return out
+}
+
+func intIDs(ids []string) []int {
+	var out []int
+	for _, id := range ids {
+		n, _ := strconv.Atoi(id)
+		out = append(out, n)
+	}
+	return out
+}
+
+func problem(w http.ResponseWriter, status int, detail string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"type": "https://silo/problems/x", "title": http.StatusText(status), "status": status, "detail": detail, "instance": "urn:silo:request:1"})
+}
+
+// handler fakes Silo's /api/v2 admin API, including its ETag preconditions.
+// Any /api/v1 call fails the test, as it answers 410 on a current Silo.
 func (f *fakeSilo) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Plugin route proxy (what Silo does for /api/v1/plugins/<id>/...).
-		if rest, ok := strings.CutPrefix(r.URL.Path, "/api/v1/plugins/7"); ok {
-			body, _ := io.ReadAll(r.Body)
-			resp, _ := f.routes.Handle(r.Context(), &pluginv1.HandleHTTPRequest{Method: r.Method, Path: rest, Body: body})
-			for k, v := range resp.GetHeaders() {
-				w.Header().Set(k, v)
-			}
-			w.WriteHeader(int(resp.GetStatusCode()))
-			_, _ = w.Write(resp.GetBody())
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			t.Errorf("plugin called retired API: %s %s", r.Method, r.URL.Path)
+			problem(w, http.StatusGone, "client_upgrade_required")
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer sa_admin" {
-			w.WriteHeader(http.StatusUnauthorized)
+			problem(w, http.StatusUnauthorized, "no key")
 			return
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		path := strings.TrimPrefix(r.URL.Path, "/api/v1")
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		switch {
-		case r.Method == http.MethodPost && len(parts) == 5 && parts[1] == "items" && parts[4] == "apply" && f.goneIDs[parts[2]]:
+		recordRequest(r)
+		path, ok := strings.CutPrefix(r.URL.Path, "/api/v2")
+		if !ok {
+			t.Errorf("unexpected Silo request %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = io.WriteString(w, `{"error":"not_found","message":"Item not found"}`)
-		case r.Method == http.MethodPost && len(parts) == 5 && parts[1] == "items" && parts[4] == "apply":
+			return
+		}
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		coll := func() (string, bool) {
+			id := parts[2]
+			if _, ok := f.collTitle[id]; !ok {
+				problem(w, http.StatusNotFound, "Collection not found")
+				return id, false
+			}
+			return id, true
+		}
+		guard := func(id string) bool {
+			switch m := r.Header.Get("If-Match"); {
+			case m == "":
+				problem(w, http.StatusPreconditionRequired, "If-Match required")
+				return false
+			case m != "*" && m != f.etag(id):
+				w.Header().Set("ETag", f.etag(id))
+				problem(w, http.StatusPreconditionFailed, "stale")
+				return false
+			}
+			return true
+		}
+		switch {
+		case r.Method == http.MethodPost && len(parts) == 5 && parts[1] == "items" && parts[3] == "images" && parts[4] == "apply":
+			t.Errorf("plugin used images/apply; posters should be uploaded")
+			problem(w, http.StatusBadRequest, "no")
+		case r.Method == http.MethodPost && len(parts) == 5 && parts[1] == "items" && parts[4] == "upload" && f.goneIDs[parts[2]]:
+			problem(w, http.StatusNotFound, "Item not found")
+		case r.Method == http.MethodPost && len(parts) == 5 && parts[1] == "items" && parts[4] == "upload":
 			f.writes++
-			var req struct {
-				OriginalURL string `json:"original_url"`
-				Type        string `json:"type"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.Type != "poster" || strings.Contains(req.OriginalURL, "token") {
-				t.Errorf("bad apply request %+v", req)
-			}
-			f.mu.Unlock()
-			resp, err := http.Get(req.OriginalURL) // Silo downloads the image
-			f.mu.Lock()
-			if err != nil || resp.StatusCode != 200 {
-				t.Errorf("Silo could not fetch relay URL %s: %v", req.OriginalURL, err)
-				w.WriteHeader(http.StatusInternalServerError)
+			if err := r.ParseMultipartForm(16 << 20); err != nil {
+				t.Errorf("upload form: %v", err)
+				problem(w, http.StatusBadRequest, "form")
 				return
 			}
-			data, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			file, _, err := r.FormFile("image")
+			if err != nil || r.FormValue("type") != "poster" {
+				t.Errorf("bad upload: type=%q err=%v", r.FormValue("type"), err)
+				problem(w, http.StatusBadRequest, "form")
+				return
+			}
+			data, _ := io.ReadAll(file)
 			f.applied[parts[2]] = string(data)
 			if f.onApply != nil {
 				f.onApply()
 			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{}`)
+			_, _ = io.WriteString(w, `{"content_id":"`+parts[2]+`","stored_path":"x","thumbhash":"y"}`)
 		case r.Method == http.MethodGet && path == "/admin/collections":
-			var list []map[string]any
+			list := []map[string]any{}
 			for id, title := range f.collTitle {
-				list = append(list, map[string]any{"id": id, "title": title, "slug": f.collSlug[id], "library_ids": f.collLibs[id]})
+				list = append(list, map[string]any{"id": id, "title": title, "slug": f.collSlug[id], "library_ids": stringIDs(f.collLibs[id])})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"collections": list})
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "groups": []any{}, "page": map[string]any{"has_more": false}})
 		case r.Method == http.MethodPost && path == "/admin/collections":
 			f.writes++
 			var req struct {
-				Title          string `json:"title"`
-				Slug           string `json:"slug"`
-				LibraryIDs     []int  `json:"library_ids"`
-				CollectionType string `json:"collection_type"`
+				Title          string   `json:"title"`
+				Slug           string   `json:"slug"`
+				LibraryIDs     []string `json:"library_ids"`
+				CollectionType string   `json:"collection_type"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.CollectionType != "manual" {
@@ -279,41 +340,68 @@ func (f *fakeSilo) handler(t *testing.T) http.Handler {
 					t.Errorf("duplicate slug %q created", req.Slug)
 				}
 			}
-			f.collTitle[id], f.collLibs[id], f.collItems[id], f.collSlug[id] = req.Title, req.LibraryIDs, map[string]bool{}, req.Slug
+			f.collTitle[id], f.collLibs[id], f.collItems[id], f.collSlug[id] = req.Title, intIDs(req.LibraryIDs), map[string]bool{}, req.Slug
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": id, "title": req.Title})
-		case len(parts) == 3 && parts[1] == "collections" && r.Method == http.MethodPut:
-			f.writes++
-			id := parts[2]
-			if _, ok := f.collTitle[id]; !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			var upd struct {
-				LibraryIDs []int `json:"library_ids"`
-			}
-			if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
-				_ = r.ParseMultipartForm(1 << 20)
-				_ = json.Unmarshal([]byte(r.FormValue("data")), &upd)
-			} else {
-				_ = json.NewDecoder(r.Body).Decode(&upd)
-			}
-			if upd.LibraryIDs != nil {
-				f.collLibs[id] = upd.LibraryIDs
-			}
-			if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
-				file, hdr, err := r.FormFile("poster")
-				if err != nil || hdr.Header.Get("Content-Type") != "image/jpeg" {
-					t.Errorf("poster part: %v %v", err, hdr)
-				} else {
-					data, _ := io.ReadAll(file)
-					f.collPost[id] = string(data)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "title": req.Title, "library_ids": req.LibraryIDs})
+		case len(parts) == 3 && parts[1] == "collections" && r.Method == http.MethodGet:
+			if id, ok := coll(); ok {
+				w.Header().Set("ETag", f.etag(id))
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "title": f.collTitle[id]})
+				if f.staleOnce { // someone edits it in Silo before our write lands
+					f.staleOnce = false
+					f.bump(id)
 				}
 			}
-		case len(parts) == 3 && parts[1] == "collections" && r.Method == http.MethodDelete:
+		case len(parts) == 3 && parts[1] == "collections" && r.Method == http.MethodPatch:
+			id, ok := coll()
+			if !ok || !guard(id) {
+				return
+			}
 			f.writes++
-			delete(f.collTitle, parts[2])
-			f.deleted = append(f.deleted, parts[2])
+			var upd struct {
+				Title      *string   `json:"title"`
+				LibraryIDs *[]string `json:"library_ids"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&upd)
+			if upd.LibraryIDs != nil {
+				f.collLibs[id] = intIDs(*upd.LibraryIDs)
+			}
+			if upd.Title != nil {
+				f.collTitle[id] = *upd.Title
+			}
+			f.bump(id)
+			w.Header().Set("ETag", f.etag(id))
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+		case len(parts) == 4 && parts[1] == "collections" && parts[3] == "poster" && r.Method == http.MethodPut:
+			id, ok := coll()
+			if !ok {
+				return
+			}
+			f.writes++
+			_ = r.ParseMultipartForm(16 << 20)
+			file, hdr, err := r.FormFile("image")
+			if err != nil || hdr.Header.Get("Content-Type") != "image/jpeg" {
+				t.Errorf("poster part: %v %v", err, hdr)
+				problem(w, http.StatusBadRequest, "image")
+				return
+			}
+			data, _ := io.ReadAll(file)
+			f.collPost[id] = string(data)
+			f.bump(id)
+			w.Header().Set("ETag", f.etag(id))
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+		case len(parts) == 3 && parts[1] == "collections" && r.Method == http.MethodDelete:
+			id, ok := coll()
+			if !ok || !guard(id) {
+				return
+			}
+			if f.inUse[id] {
+				problem(w, http.StatusConflict, "Collection is used by a page section")
+				return
+			}
+			f.writes++
+			delete(f.collTitle, id)
+			f.deleted = append(f.deleted, id)
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && len(parts) == 3 && parts[0] == "catalog" && parts[1] == "items":
 			_ = json.NewEncoder(w).Encode(map[string]any{"content_id": parts[2], "locked_fields": f.locks[parts[2]]})
@@ -336,57 +424,84 @@ func (f *fakeSilo) handler(t *testing.T) http.Handler {
 			}
 			f.refreshed = append(f.refreshed, parts[2])
 			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": "job-" + parts[2], "status": "queued"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "job-" + parts[2], "state": "queued", "terminal": false})
 		case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "jobs":
 			f.jobPolls[parts[2]]++
-			status := "running"
+			state, terminal := "running", false
 			if f.jobPolls[parts[2]] > 1 {
-				status = "completed"
+				state, terminal = "succeeded", true
 			}
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": parts[2], "status": status})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": parts[2], "state": state, "terminal": terminal})
 		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items" && r.Method == http.MethodPut && f.fkGone[parts[4]]:
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = io.WriteString(w, `{"error":"internal_error","message":"Failed to add collection item"}`)
-		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items" && f.throttle > 0:
+			problem(w, http.StatusNotFound, "Item not found in collection libraries")
+		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items" && parts[4] != "order" && f.throttle > 0:
 			f.throttle--
 			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"error":"rate_limit_exceeded","retry_after":1}`)
+			problem(w, http.StatusTooManyRequests, "slow down")
+		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items" && parts[4] == "order" && r.Method == http.MethodGet:
+			id, ok := coll()
+			if !ok {
+				return
+			}
+			ids := f.ordered(id)
+			more := len(ids) > orderWindow
+			if more {
+				ids = ids[:orderWindow]
+			}
+			w.Header().Set("ETag", f.etag(id))
+			_ = json.NewEncoder(w).Encode(map[string]any{"ordered_ids": ids, "has_more": more, "group_id": nil})
 		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items" && parts[4] == "order" && r.Method == http.MethodPut:
+			id, ok := coll()
+			if !ok || !guard(id) {
+				return
+			}
 			f.writes++
 			var req struct {
 				OrderedIDs []string `json:"ordered_ids"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			// Like Silo: the list must name exactly the items the collection holds.
-			if len(req.OrderedIDs) != len(f.collItems[parts[2]]) {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = io.WriteString(w, `{"error":"bad_request","message":"ordered ids do not match collection items"}`)
+			if len(req.OrderedIDs) != len(f.collItems[id]) {
+				problem(w, http.StatusUnprocessableEntity, "ordered ids do not match collection items")
 				return
 			}
-			for _, id := range req.OrderedIDs {
-				if !f.collItems[parts[2]][id] {
-					w.WriteHeader(http.StatusBadRequest)
+			for _, item := range req.OrderedIDs {
+				if !f.collItems[id][item] {
+					problem(w, http.StatusUnprocessableEntity, "unknown id")
 					return
 				}
 			}
 			f.reorders++
-			for i, id := range req.OrderedIDs {
-				f.pos(parts[2])[id] = i
+			for i, item := range req.OrderedIDs {
+				f.pos(id)[item] = i
 			}
-			w.WriteHeader(http.StatusNoContent)
+			f.bump(id)
+			w.Header().Set("ETag", f.etag(id))
+			_ = json.NewEncoder(w).Encode(map[string]any{"ordered_ids": f.ordered(id), "has_more": false})
 		case len(parts) == 5 && parts[1] == "collections" && parts[3] == "items":
+			id, ok := coll()
+			if !ok {
+				return
+			}
 			f.writes++
 			if r.Method == http.MethodPut {
 				var req struct {
-					Position int `json:"position"`
+					Position *int `json:"position"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				f.collItems[parts[2]][parts[4]] = true
-				f.pos(parts[2])[parts[4]] = req.Position
+				if req.Position == nil {
+					problem(w, http.StatusUnprocessableEntity, "position required")
+					return
+				}
+				// Like Silo v2: add if absent; an existing item keeps its position.
+				if !f.collItems[id][parts[4]] {
+					f.collItems[id][parts[4]] = true
+					f.pos(id)[parts[4]] = *req.Position
+				}
 			} else {
-				delete(f.collItems[parts[2]], parts[4])
+				delete(f.collItems[id], parts[4])
 			}
+			f.bump(id)
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Errorf("unexpected Silo request %s %s", r.Method, r.URL)
@@ -395,6 +510,9 @@ func (f *fakeSilo) handler(t *testing.T) http.Handler {
 	})
 }
 
+// orderWindow is how many members Silo's items/order read returns.
+var orderWindow = 200
+
 // ---- test ----
 
 func TestSyncEndToEnd(t *testing.T) {
@@ -402,9 +520,8 @@ func TestSyncEndToEnd(t *testing.T) {
 	plexSrv := httptest.NewServer(plex.handler(t))
 	defer plexSrv.Close()
 
-	relay := newImageRelay()
 	silo := &fakeSilo{
-		routes:  &routesServer{p: &plugin{relay: relay}},
+		routes:  &routesServer{p: &plugin{}},
 		applied: map[string]string{}, collTitle: map[string]string{}, collLibs: map[string][]int{},
 		collItems: map[string]map[string]bool{}, collPost: map[string]string{},
 		locks: map[string][]int{}, jobPolls: map[string]int{},
@@ -428,8 +545,7 @@ func TestSyncEndToEnd(t *testing.T) {
 		}
 		summary := &runSummary{}
 		s := &syncer{cfg: cfg, catalog: catalog, plex: newPlexClient(plexSrv.URL, "plex-token"),
-			silo: newSiloClient(siloSrv.URL, "sa_admin"), relay: relay, relayURL: siloSrv.URL + "/api/v1/plugins/7/img/",
-			state: st, log: func(string, ...any) {}, summary: summary}
+			silo: newSiloClient(siloSrv.URL, "sa_admin"), state: st, log: func(string, ...any) {}, summary: summary}
 		if err := s.run(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -452,9 +568,6 @@ func TestSyncEndToEnd(t *testing.T) {
 	}
 	if len(silo.collItems["c1"]) != 2 || silo.collPost["c1"] != "IMAGE:/library/metadata/900/thumb/5" || silo.collLibs["c1"][0] != 3 {
 		t.Fatalf("collection = items %v poster %q libs %v", silo.collItems["c1"], silo.collPost["c1"], silo.collLibs["c1"])
-	}
-	if len(relay.entries) != 0 {
-		t.Fatal("relay entries were not dropped")
 	}
 
 	// Run 2: nothing changed in Plex, so nothing is written to Silo.
@@ -503,7 +616,7 @@ func TestSyncEndToEnd(t *testing.T) {
 }
 
 func TestWebhookSecretAndEvents(t *testing.T) {
-	p := &plugin{log: hclog.NewNullLogger(), relay: newImageRelay(), cfg: Config{WebhookSecret: "hunter2", DelayMinutes: 60}}
+	p := &plugin{log: hclog.NewNullLogger(), cfg: Config{WebhookSecret: "hunter2", DelayMinutes: 60}}
 	r := &routesServer{p: p}
 	call := func(secret, body string) int32 {
 		q, _ := toStruct(map[string]any{"secret": secret})
@@ -557,14 +670,14 @@ func TestOversizedPosterIsReencoded(t *testing.T) {
 	if err := png.Encode(&buf, img); err != nil {
 		t.Fatal(err)
 	}
-	if buf.Len() <= maxRelayBytes {
+	if buf.Len() <= maxUploadBytes {
 		t.Fatalf("test image too small: %d", buf.Len())
 	}
-	out, err := fitForRelay(buf.Bytes())
+	out, err := fitForUpload(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxRelayBytes || http.DetectContentType(out) != "image/jpeg" {
+	if len(out) > maxUploadBytes || http.DetectContentType(out) != "image/jpeg" {
 		t.Fatalf("re-encoded to %d bytes, %s", len(out), http.DetectContentType(out))
 	}
 }
@@ -573,7 +686,7 @@ func TestConnectionCheckPage(t *testing.T) {
 	plex := &fakePlex{movieThumbA: "/x"}
 	srv := httptest.NewServer(plex.handler(t))
 	defer srv.Close()
-	p := &plugin{log: hclog.NewNullLogger(), relay: newImageRelay(), cfg: Config{
+	p := &plugin{log: hclog.NewNullLogger(), cfg: Config{
 		PlexURL: srv.URL, PlexToken: "plex-token", SiloAPIKey: "sa_x", WebhookSecret: "s",
 		PlexLibraries: []string{"Movies", "Kids"}, OnlyOverlaid: true}}
 	checks := p.connectionCheck(context.Background(), p.cfg)
@@ -603,7 +716,7 @@ func TestConnectionCheckPage(t *testing.T) {
 func TestTaskRunReturnsImmediately(t *testing.T) {
 	// No host and no config: the background sync fails fast, but Run itself
 	// must return at once regardless of how long a sync would take.
-	p := &plugin{log: hclog.NewNullLogger(), relay: newImageRelay()}
+	p := &plugin{log: hclog.NewNullLogger()}
 	start := time.Now()
 	resp, err := (&taskServer{p: p}).Run(context.Background(), &pluginv1.RunScheduledTaskRequest{})
 	if err != nil || resp.GetOutput().AsMap()["started"] != true {
@@ -637,9 +750,8 @@ func TestRevertLibrary(t *testing.T) {
 	plex := &fakePlex{movieThumbA: "/library/metadata/10/thumb/1", collMembers: []string{"100", "200"}, collections: true}
 	plexSrv := httptest.NewServer(plex.handler(t))
 	defer plexSrv.Close()
-	relay := newImageRelay()
 	silo := &fakeSilo{
-		routes:  &routesServer{p: &plugin{relay: relay}},
+		routes:  &routesServer{p: &plugin{}},
 		applied: map[string]string{}, collTitle: map[string]string{}, collLibs: map[string][]int{},
 		collItems: map[string]map[string]bool{}, collPost: map[string]string{},
 		locks: map[string][]int{}, jobPolls: map[string]int{},
@@ -657,8 +769,7 @@ func TestRevertLibrary(t *testing.T) {
 	st, _ := loadState(context.Background(), state)
 	sum := &runSummary{}
 	s := &syncer{cfg: cfg, catalog: catalog, plex: newPlexClient(plexSrv.URL, "plex-token"),
-		silo: newSiloClient(siloSrv.URL, "sa_admin"), relay: relay, relayURL: siloSrv.URL + "/api/v1/plugins/7/img/",
-		state: st, log: func(string, ...any) {}, summary: sum}
+		silo: newSiloClient(siloSrv.URL, "sa_admin"), state: st, log: func(string, ...any) {}, summary: sum}
 	if err := s.run(context.Background()); err != nil || sum.PostersApplied != 3 {
 		t.Fatalf("sync: %v %+v", err, sum)
 	}
@@ -701,7 +812,7 @@ func TestRevertLibrary(t *testing.T) {
 }
 
 func TestRevertFormGuards(t *testing.T) {
-	p := &plugin{log: hclog.NewNullLogger(), relay: newImageRelay()}
+	p := &plugin{log: hclog.NewNullLogger()}
 	r := &routesServer{p: p}
 	post := func(body string) int32 {
 		resp, _ := r.Handle(context.Background(), &pluginv1.HandleHTTPRequest{Method: "POST", Path: "/revert", Body: []byte(body)})
@@ -758,7 +869,7 @@ func TestTook(t *testing.T) {
 }
 
 func TestProgressEndpoint(t *testing.T) {
-	p := &plugin{log: hclog.NewNullLogger(), relay: newImageRelay()}
+	p := &plugin{log: hclog.NewNullLogger()}
 	r := &routesServer{p: p}
 	get := func() progressView {
 		resp, _ := r.Handle(context.Background(), &pluginv1.HandleHTTPRequest{Method: "GET", Path: "/progress"})
@@ -811,7 +922,7 @@ func TestResetCollectionsDeletesOnlyPluginCollections(t *testing.T) {
 }
 
 func TestRateLimitedRequestsAreRetried(t *testing.T) {
-	silo := &fakeSilo{collItems: map[string]map[string]bool{"c1": {}}, collTitle: map[string]string{}, throttle: 2}
+	silo := &fakeSilo{collItems: map[string]map[string]bool{"c1": {}}, collTitle: map[string]string{"c1": "Marvel"}, throttle: 2}
 	srv := httptest.NewServer(silo.handler(t))
 	defer srv.Close()
 	c := newSiloClient(srv.URL, "sa_admin")
@@ -890,7 +1001,7 @@ func TestSyncWithNoLibrariesSelected(t *testing.T) {
 	st, _ := loadState(context.Background(), &memState{m: map[string][]byte{}})
 	sum := &runSummary{}
 	s := &syncer{cfg: Config{SyncCollections: true}, catalog: &fakeCatalog{}, plex: newPlexClient(plexSrv.URL, "plex-token"),
-		silo: newSiloClient(siloSrv.URL, "sa_admin"), relay: newImageRelay(), state: st, log: func(string, ...any) {},
+		silo: newSiloClient(siloSrv.URL, "sa_admin"), state: st, log: func(string, ...any) {},
 		summary: sum, selected: func(plexSection) bool { return false }}
 	if err := s.run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -958,8 +1069,7 @@ func TestHighestResolutionWins(t *testing.T) {
 		tvThumb: "/library/metadata/30/thumb/1", tv4kThumb: "/library/metadata/40/thumb/1"}
 	plexSrv := httptest.NewServer(plex.handler())
 	defer plexSrv.Close()
-	relay := newImageRelay()
-	silo := &fakeSilo{routes: &routesServer{p: &plugin{relay: relay}}, applied: map[string]string{}, collTitle: map[string]string{}}
+	silo := &fakeSilo{routes: &routesServer{p: &plugin{}}, applied: map[string]string{}, collTitle: map[string]string{}}
 	siloSrv := httptest.NewServer(silo.handler(t))
 	defer siloSrv.Close()
 	catalog := &fakeCatalog{byType: map[string]map[string]runtimehost.MediaPresence{
@@ -973,7 +1083,7 @@ func TestHighestResolutionWins(t *testing.T) {
 		st, _ := loadState(context.Background(), state)
 		sum := &runSummary{}
 		s := &syncer{cfg: cfg, catalog: catalog, plex: newPlexClient(plexSrv.URL, "t"), silo: newSiloClient(siloSrv.URL, "sa_admin"),
-			relay: relay, relayURL: siloSrv.URL + "/api/v1/plugins/7/img/", state: st, log: func(string, ...any) {}, summary: sum}
+			state: st, log: func(string, ...any) {}, summary: sum}
 		if err := s.run(context.Background()); err != nil || sum.ErrorCount != 0 {
 			t.Fatalf("run: %v %+v", err, sum)
 		}
@@ -1010,8 +1120,7 @@ func TestHighestResolutionCorrectsOlderRuns(t *testing.T) {
 		tvThumb: "/library/metadata/30/thumb/1", tv4kThumb: "/library/metadata/40/thumb/1"}
 	plexSrv := httptest.NewServer(plex.handler())
 	defer plexSrv.Close()
-	relay := newImageRelay()
-	silo := &fakeSilo{routes: &routesServer{p: &plugin{relay: relay}}, applied: map[string]string{"mv-film": "IMAGE:/library/metadata/10/thumb/1"}, collTitle: map[string]string{}}
+	silo := &fakeSilo{routes: &routesServer{p: &plugin{}}, applied: map[string]string{"mv-film": "IMAGE:/library/metadata/10/thumb/1"}, collTitle: map[string]string{}}
 	siloSrv := httptest.NewServer(silo.handler(t))
 	defer siloSrv.Close()
 	catalog := &fakeCatalog{byType: map[string]map[string]runtimehost.MediaPresence{"movie": {"100": {MediaID: "mv-film", LibraryID: "3"}}}}
@@ -1025,7 +1134,7 @@ func TestHighestResolutionCorrectsOlderRuns(t *testing.T) {
 		st, _ := loadState(context.Background(), state)
 		sum := &runSummary{}
 		s := &syncer{cfg: Config{OnlyOverlaid: true}, catalog: catalog, plex: newPlexClient(plexSrv.URL, "t"), silo: newSiloClient(siloSrv.URL, "sa_admin"),
-			relay: relay, relayURL: siloSrv.URL + "/api/v1/plugins/7/img/", state: st, log: func(string, ...any) {}, summary: sum}
+			state: st, log: func(string, ...any) {}, summary: sum}
 		if err := s.run(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -1044,8 +1153,7 @@ func TestDuplicatePolicyChoices(t *testing.T) {
 		tvThumb: "/library/metadata/30/thumb/1", tv4kThumb: "/library/metadata/40/thumb/1"}
 	plexSrv := httptest.NewServer(plex.handler())
 	defer plexSrv.Close()
-	relay := newImageRelay()
-	silo := &fakeSilo{routes: &routesServer{p: &plugin{relay: relay}}, applied: map[string]string{}, collTitle: map[string]string{}}
+	silo := &fakeSilo{routes: &routesServer{p: &plugin{}}, applied: map[string]string{}, collTitle: map[string]string{}}
 	siloSrv := httptest.NewServer(silo.handler(t))
 	defer siloSrv.Close()
 	catalog := &fakeCatalog{byType: map[string]map[string]runtimehost.MediaPresence{
@@ -1059,8 +1167,7 @@ func TestDuplicatePolicyChoices(t *testing.T) {
 		st, _ := loadState(context.Background(), state)
 		sum := &runSummary{}
 		s := &syncer{cfg: Config{OnlyOverlaid: true}, catalog: catalog, plex: newPlexClient(plexSrv.URL, "t"),
-			silo: newSiloClient(siloSrv.URL, "sa_admin"), relay: relay, relayURL: siloSrv.URL + "/api/v1/plugins/7/img/",
-			state: st, log: func(string, ...any) {}, summary: sum, rank: policy.rankFunc(), policy: policy.signature()}
+			silo: newSiloClient(siloSrv.URL, "sa_admin"), state: st, log: func(string, ...any) {}, summary: sum, rank: policy.rankFunc(), policy: policy.signature()}
 		if err := s.run(context.Background()); err != nil || sum.ErrorCount != 0 {
 			t.Fatalf("run: %v %+v", err, sum)
 		}
@@ -1160,8 +1267,7 @@ func newHarness(t *testing.T, cat presenceLookup) *collectionHarness {
 	h := &collectionHarness{t: t, cat: cat, state: &memState{m: map[string][]byte{}}}
 	h.plex = &fakePlex{movieThumbA: "/library/metadata/10/thumb/1", collMembers: []string{"100", "200"}, collections: true}
 	h.plexS = httptest.NewServer(h.plex.handler(t))
-	relay := newImageRelay()
-	h.silo = &fakeSilo{routes: &routesServer{p: &plugin{relay: relay}}, applied: map[string]string{}, collTitle: map[string]string{},
+	h.silo = &fakeSilo{routes: &routesServer{p: &plugin{}}, applied: map[string]string{}, collTitle: map[string]string{},
 		collLibs: map[string][]int{}, collItems: map[string]map[string]bool{}, collPost: map[string]string{}, collSlug: map[string]string{},
 		locks: map[string][]int{}, jobPolls: map[string]int{}, goneIDs: map[string]bool{}}
 	h.siloS = httptest.NewServer(h.silo.handler(t))
@@ -1175,8 +1281,8 @@ func (h *collectionHarness) run() *runSummary {
 	sum := &runSummary{}
 	s := &syncer{cfg: Config{OnlyOverlaid: true, SyncCollections: true, DeleteRemoved: true}, catalog: h.cat,
 		plex: newPlexClient(h.plexS.URL, "plex-token"), silo: newSiloClient(h.siloS.URL, "sa_admin"),
-		relay: h.silo.routes.p.relay, relayURL: h.siloS.URL + "/api/v1/plugins/7/img/", state: st,
-		log: func(string, ...any) {}, summary: sum, siloLibraries: h.libs, libraryMap: h.mapg, progress: &syncProgress{}}
+		state: st,
+		log:   func(string, ...any) {}, summary: sum, siloLibraries: h.libs, libraryMap: h.mapg, progress: &syncProgress{}}
 	if err := s.run(context.Background()); err != nil {
 		h.t.Fatal(err)
 	}
@@ -1364,7 +1470,7 @@ type comboHarness struct {
 func newComboHarness(t *testing.T) *comboHarness {
 	h := &comboHarness{t: t, plex: &comboPlex{}, state: &memState{m: map[string][]byte{}}}
 	h.plexS = httptest.NewServer(h.plex.handler())
-	h.silo = &fakeSilo{routes: &routesServer{p: &plugin{relay: newImageRelay()}}, applied: map[string]string{}, collTitle: map[string]string{},
+	h.silo = &fakeSilo{routes: &routesServer{p: &plugin{}}, applied: map[string]string{}, collTitle: map[string]string{},
 		collLibs: map[string][]int{}, collItems: map[string]map[string]bool{}, collPost: map[string]string{}, collSlug: map[string]string{},
 		goneIDs: map[string]bool{}}
 	h.siloS = httptest.NewServer(h.silo.handler(t))
@@ -1379,8 +1485,7 @@ func (h *comboHarness) run(combined bool) *runSummary {
 	cat := &fakeCatalog{byType: map[string]map[string]runtimehost.MediaPresence{"movie": {
 		"100": {MediaID: "mv-a", LibraryID: "1"}, "200": {MediaID: "mv-b", LibraryID: "1"}, "300": {MediaID: "mv-c", LibraryID: "2"}}}}
 	s := &syncer{cfg: Config{OnlyOverlaid: true, SyncCollections: true, DeleteRemoved: true}, catalog: cat,
-		plex: newPlexClient(h.plexS.URL, "t"), silo: newSiloClient(h.siloS.URL, "sa_admin"), relay: h.silo.routes.p.relay,
-		relayURL: h.siloS.URL + "/api/v1/plugins/7/img/", state: st, log: func(string, ...any) {}, summary: sum,
+		plex: newPlexClient(h.plexS.URL, "t"), silo: newSiloClient(h.siloS.URL, "sa_admin"), state: st, log: func(string, ...any) {}, summary: sum,
 		siloLibraries: []siloLibrary{{1, "Movies", "movie"}, {2, "Movies 4K", "movie"}}, combined: combined, progress: &syncProgress{}}
 	if err := s.run(context.Background()); err != nil {
 		h.t.Fatal(err)
@@ -1503,7 +1608,7 @@ func TestCollectionsOffNote(t *testing.T) {
 	st, _ := loadState(context.Background(), h.state)
 	sum := &runSummary{}
 	s := &syncer{cfg: Config{OnlyOverlaid: true}, catalog: &fakeCatalog{}, plex: newPlexClient(h.plexS.URL, "t"),
-		silo: newSiloClient(h.siloS.URL, "sa_admin"), relay: newImageRelay(), state: st, log: func(string, ...any) {}, summary: sum}
+		silo: newSiloClient(h.siloS.URL, "sa_admin"), state: st, log: func(string, ...any) {}, summary: sum}
 	if err := s.run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1583,7 +1688,7 @@ func TestCollectionOrderFollowsPlex(t *testing.T) {
 		st, _ := loadState(context.Background(), state)
 		sum := &runSummary{}
 		s := &syncer{cfg: Config{OnlyOverlaid: true, SyncCollections: true}, catalog: &fakeCatalog{byType: map[string]map[string]runtimehost.MediaPresence{"movie": movies}},
-			plex: newPlexClient(plexS.URL, "t"), silo: newSiloClient(siloS.URL, "sa_admin"), relay: newImageRelay(), state: st,
+			plex: newPlexClient(plexS.URL, "t"), silo: newSiloClient(siloS.URL, "sa_admin"), state: st,
 			log: func(string, ...any) {}, summary: sum, siloLibraries: []siloLibrary{{1, "Movies", "movie"}}}
 		if err := s.run(context.Background()); err != nil || sum.ErrorCount != 0 {
 			t.Fatalf("run: %v %+v", err, sum)
@@ -1667,8 +1772,8 @@ func TestCancelledSyncKeepsProgress(t *testing.T) {
 	sum := &runSummary{}
 	s := &syncer{cfg: Config{OnlyOverlaid: true}, catalog: h.cat,
 		plex: newPlexClient(h.plexS.URL, "plex-token"), silo: newSiloClient(h.siloS.URL, "sa_admin"),
-		relay: h.silo.routes.p.relay, relayURL: h.siloS.URL + "/api/v1/plugins/7/img/", state: st,
-		log: func(string, ...any) {}, summary: sum, progress: &syncProgress{}}
+		state: st,
+		log:   func(string, ...any) {}, summary: sum, progress: &syncProgress{}}
 	err := s.run(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("run should report cancellation, got %v", err)
@@ -1693,7 +1798,7 @@ func TestCancelledSyncKeepsProgress(t *testing.T) {
 }
 
 func TestCancelEndpoint(t *testing.T) {
-	p := &plugin{relay: newImageRelay(), formToken: "tok", log: hclog.NewNullLogger()}
+	p := &plugin{formToken: "tok", log: hclog.NewNullLogger()}
 	r := &routesServer{p: p}
 	post := func(body string) int {
 		resp, _ := r.Handle(context.Background(), &pluginv1.HandleHTTPRequest{Method: "POST", Path: "/cancel", Body: []byte(body)})
@@ -1719,4 +1824,177 @@ func TestCancelEndpoint(t *testing.T) {
 	if !p.endStop() {
 		t.Fatal("endStop should report the cancellation")
 	}
+}
+
+func newV2Silo(t *testing.T) (*fakeSilo, *SiloClient) {
+	t.Helper()
+	f := &fakeSilo{applied: map[string]string{}, collTitle: map[string]string{}, collLibs: map[string][]int{},
+		collItems: map[string]map[string]bool{}, collPost: map[string]string{}, locks: map[string][]int{}, jobPolls: map[string]int{}}
+	srv := httptest.NewServer(f.handler(t))
+	t.Cleanup(srv.Close)
+	return f, newSiloClient(srv.URL, "sa_admin")
+}
+
+func TestV2CollectionWritesUseETags(t *testing.T) {
+	f, c := newV2Silo(t)
+	ctx := context.Background()
+	id, err := c.CreateCollection(ctx, "Marvel", "kometa-c-movie-marvel", []int{3, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.collLibs[id], []int{3, 5}) {
+		t.Fatalf("library ids sent as strings should round-trip: %v", f.collLibs[id])
+	}
+	list, err := c.ListCollections(ctx)
+	if err != nil || len(list) != 1 || list[0].Slug != "kometa-c-movie-marvel" || !slices.Equal(list[0].LibraryIDs, []int{3, 5}) {
+		t.Fatalf("list = %+v, %v", list, err)
+	}
+
+	// A collection edited in Silo between our read and write: 412, then one retry.
+	f.staleOnce = true
+	if err := c.UpdateCollection(ctx, id, "Marvel Cinematic Universe", []int{3}); err != nil {
+		t.Fatalf("update should retry once after a stale ETag: %v", err)
+	}
+	if f.collTitle[id] != "Marvel Cinematic Universe" || !slices.Equal(f.collLibs[id], []int{3}) {
+		t.Fatalf("update not applied: %q %v", f.collTitle[id], f.collLibs[id])
+	}
+
+	if err := c.SetCollectionPoster(ctx, id, []byte("\xff\xd8\xff\xe0poster")); err != nil || f.collPost[id] == "" {
+		t.Fatalf("poster upload: %v", err)
+	}
+
+	f.inUse = map[string]bool{id: true}
+	if err := c.DeleteCollection(ctx, id); !errors.Is(err, errConflict) || !strings.Contains(err.Error(), "page row") {
+		t.Fatalf("delete of a collection a row shows should explain the 409: %v", err)
+	}
+	f.inUse = nil
+	if err := c.DeleteCollection(ctx, id); err != nil || f.collTitle[id] != "" {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := c.DeleteCollection(ctx, id); err != nil {
+		t.Fatalf("deleting a collection that's already gone is fine: %v", err)
+	}
+}
+
+func TestV2ReorderKeepsUnknownItemsAndSkipsLargeCollections(t *testing.T) {
+	f, c := newV2Silo(t)
+	ctx := context.Background()
+	id, _ := c.CreateCollection(ctx, "Trending", "kometa-1-trending", []int{3})
+	for i, item := range []string{"a", "b", "mine", "c"} {
+		if err := c.AddCollectionItem(ctx, id, item, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// "mine" was added in Silo by hand; the plugin's order doesn't name it.
+	if err := c.ReorderCollection(ctx, id, []string{"c", "b", "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.ordered(id); !slices.Equal(got, []string{"c", "b", "a", "mine"}) {
+		t.Fatalf("order = %v", got)
+	}
+	writes := f.reorders
+	if err := c.ReorderCollection(ctx, id, []string{"c", "b", "a"}); err != nil || f.reorders != writes {
+		t.Fatalf("an unchanged order should not be written again: %v", err)
+	}
+
+	defer func(n int) { orderWindow = n }(orderWindow)
+	orderWindow = 2
+	if err := c.ReorderCollection(ctx, id, []string{"a", "b", "c"}); !errors.Is(err, errOrderTooLarge) {
+		t.Fatalf("over Silo's reorder window should be errOrderTooLarge, got %v", err)
+	}
+}
+
+func TestV2PosterUploadAndRefreshJob(t *testing.T) {
+	f, c := newV2Silo(t)
+	ctx := context.Background()
+	if err := c.UploadPoster(ctx, "movie-tmdb-1", []byte("\xff\xd8\xff\xe0img")); err != nil || f.applied["movie-tmdb-1"] == "" {
+		t.Fatalf("upload: %v", err)
+	}
+	f.goneIDs = map[string]bool{"movie-tmdb-2": true}
+	if err := c.UploadPoster(ctx, "movie-tmdb-2", []byte("\xff\xd8\xff\xe0img")); !errors.Is(err, errNotFound) {
+		t.Fatalf("re-keyed item should be errNotFound: %v", err)
+	}
+	job, err := c.RefreshItem(ctx, "movie-tmdb-1")
+	if err != nil || job == "" {
+		t.Fatal(err)
+	}
+	for {
+		state, terminal, _, err := c.JobStatus(ctx, job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if terminal {
+			if state != "succeeded" {
+				t.Fatalf("state %q", state)
+			}
+			break
+		}
+	}
+}
+
+func TestRetiredAPIIsExplained(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		problem(w, http.StatusGone, "client_upgrade_required")
+	}))
+	defer srv.Close()
+	err := newSiloClient(srv.URL, "k").Ping(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "update the plugin") {
+		t.Fatalf("410 should tell the admin to update: %v", err)
+	}
+}
+
+func TestHeartbeatOnlyWhileBusy(t *testing.T) {
+	p := &plugin{log: hclog.NewNullLogger()}
+	if p.busy() {
+		t.Fatal("idle plugin should not keep Silo awake")
+	}
+	p.running = true
+	if !p.busy() {
+		t.Fatal("a running sync must keep the plugin alive")
+	}
+	p.running = false
+	p.timer = time.AfterFunc(time.Hour, func() {})
+	defer p.timer.Stop()
+	if !p.busy() {
+		t.Fatal("a scheduled webhook sync must keep the plugin alive")
+	}
+}
+
+// recordRequest appends each request's method, path, headers and body to
+// $RECORD_REQUESTS (one JSON object per line), for checking against Silo's
+// OpenAPI contract outside the test.
+var recordMu sync.Mutex
+
+func recordRequest(r *http.Request) {
+	file := os.Getenv("RECORD_REQUESTS")
+	if file == "" {
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	rec := map[string]any{"method": r.Method, "path": r.URL.Path, "content_type": r.Header.Get("Content-Type"),
+		"if_match": r.Header.Get("If-Match")}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+		if mr, err := multipart.NewReader(bytes.NewReader(body), strings.Split(r.Header.Get("Content-Type"), "boundary=")[1]).ReadForm(32 << 20); err == nil {
+			fields := map[string]any{}
+			for k, v := range mr.Value {
+				fields[k] = v[0]
+			}
+			for k := range mr.File {
+				fields[k] = "<file>"
+			}
+			rec["form"] = fields
+		}
+	} else if len(body) > 0 {
+		rec["json"] = json.RawMessage(body)
+	}
+	line, _ := json.Marshal(rec)
+	recordMu.Lock()
+	defer recordMu.Unlock()
+	fh, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer fh.Close()
+	_, _ = fh.Write(append(line, '\n'))
 }
