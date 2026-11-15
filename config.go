@@ -23,6 +23,19 @@ type Config struct {
 	SyncCollections bool
 	DeleteRemoved   bool
 	DryRun          bool
+
+	// Artwork types. Only posters are on by default, as in 0.5.0; a saved
+	// 0.5.0 config has none of these keys, so it keeps exactly that.
+	NoPosters               bool // "sync_posters" off; the zero value keeps 0.5.0's behaviour
+	SyncBackdrops           bool
+	SyncLogos               bool
+	SyncSeasonPosters       bool
+	SyncCollectionBackdrops bool
+}
+
+// wantsItemExtras reports whether any per-item artwork beyond posters is on.
+func (c Config) wantsItemExtras() bool {
+	return c.SyncBackdrops || c.SyncLogos || c.SyncSeasonPosters
 }
 
 func defaultConfig() Config {
@@ -78,6 +91,19 @@ func parseConfig(entries []*pluginv1.ConfigEntry) Config {
 	}
 	if b, ok := values["dry_run"].(bool); ok {
 		cfg.DryRun = b
+	}
+	if b, ok := values["sync_posters"].(bool); ok {
+		cfg.NoPosters = !b
+	}
+	for key, dst := range map[string]*bool{
+		"sync_backdrops":            &cfg.SyncBackdrops,
+		"sync_logos":                &cfg.SyncLogos,
+		"sync_season_posters":       &cfg.SyncSeasonPosters,
+		"sync_collection_backdrops": &cfg.SyncCollectionBackdrops,
+	} {
+		if b, ok := values[key].(bool); ok {
+			*dst = b
+		}
 	}
 	return cfg
 }
