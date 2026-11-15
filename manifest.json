@@ -6,8 +6,8 @@
   "category": "Artwork",
   "presentation": {
     "display_name": "Plex Artwork Sync",
-    "summary": "Keeps Silo's movie and series posters and collections matching Plex, including Kometa's overlays.",
-    "description_markdown": "Mirrors movie and series posters and Plex collections from Plex into Silo. Works great with Kometa: by default it copies the posters Kometa has overlaid, and Kometa's run_end webhook starts a sync after every Kometa run. Season and episode artwork is never touched.",
+    "summary": "Keeps Silo's movie, series, season and collection artwork matching Plex, including Kometa's overlays.",
+    "description_markdown": "Mirrors artwork and collections from Plex into Silo: movie and series posters, and optionally backdrops, clear logos, season posters and collection backdrops. Works great with Kometa: by default it copies the posters Kometa has overlaid, and Kometa's run_end webhook starts a sync after every Kometa run. Episode artwork is never touched, and nothing is ever written to Plex.",
     "setup_markdown": "1. Create an admin API key in Silo and paste it into the settings.\n2. Enter your Plex URL and token, and set a webhook secret.\n3. Open the plugin's status page to choose libraries.\n4. With Kometa, copy the webhook URL from the status page into Kometa's `webhooks: run_end:` setting. Without Kometa, turn off \"Only posters Kometa has overlaid\" and give the Plex Artwork Sync task a schedule.",
     "publisher_name": "Departed69",
     "license_spdx": "AGPL-3.0-or-later"
@@ -27,7 +27,7 @@
       "type": "scheduled_task.v1",
       "id": "sync",
       "display_name": "Plex Artwork Sync",
-      "description": "Syncs movie/series posters and collections from Plex into Silo. Kometa's run_end webhook can trigger it; you can also run it here or give it a schedule."
+      "description": "Syncs movie/series artwork, season posters and collections from Plex into Silo. Kometa's run_end webhook can trigger it; you can also run it here or give it a schedule."
     },
     {
       "type": "http_routes.v1",
@@ -96,7 +96,7 @@
       "title": "Plex Artwork Sync",
       "description": "Connection and sync settings.",
       "required": true,
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"plex_url\":{\"type\":\"string\"},\"plex_token\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"},\"silo_internal_url\":{\"type\":\"string\"},\"webhook_secret\":{\"type\":\"string\"},\"delay_minutes\":{\"type\":\"number\"},\"only_overlaid\":{\"type\":\"boolean\"},\"sync_collections\":{\"type\":\"boolean\"},\"delete_removed_collections\":{\"type\":\"boolean\"},\"dry_run\":{\"type\":\"boolean\"}},\"required\":[\"plex_url\",\"plex_token\",\"silo_api_key\",\"webhook_secret\"]}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"plex_url\":{\"type\":\"string\"},\"plex_token\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"},\"silo_internal_url\":{\"type\":\"string\"},\"webhook_secret\":{\"type\":\"string\"},\"delay_minutes\":{\"type\":\"number\"},\"only_overlaid\":{\"type\":\"boolean\"},\"sync_collections\":{\"type\":\"boolean\"},\"delete_removed_collections\":{\"type\":\"boolean\"},\"dry_run\":{\"type\":\"boolean\"},\"sync_posters\":{\"type\":\"boolean\"},\"sync_backdrops\":{\"type\":\"boolean\"},\"sync_logos\":{\"type\":\"boolean\"},\"sync_season_posters\":{\"type\":\"boolean\"},\"sync_collection_backdrops\":{\"type\":\"boolean\"}},\"required\":[\"plex_url\",\"plex_token\",\"silo_api_key\",\"webhook_secret\"]}",
       "admin_form": {
         "submit_label": "Save",
         "fields": [
@@ -149,9 +149,37 @@
             }
           },
           {
+            "key": "sync_posters",
+            "label": "Sync movie and TV posters",
+            "description": "Copies each movie and series poster shown in Plex. On by default, as in earlier versions.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": true
+          },
+          {
+            "key": "sync_backdrops",
+            "label": "Sync movie and TV backdrops",
+            "description": "Copies the background (fanart) selected in Plex. Items without one keep their Silo backdrop. Off by default.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
+          },
+          {
+            "key": "sync_logos",
+            "label": "Sync movie and TV logos",
+            "description": "Copies the clear logo selected in Plex, keeping its transparency. Items where Plex marks no single logo as selected are skipped and counted. Off by default.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
+          },
+          {
+            "key": "sync_season_posters",
+            "label": "Sync season posters",
+            "description": "Copies each season poster, Specials (season 0) included, to the Silo season with the same number. Seasons Silo does not have are skipped, never created. Off by default.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
+          },
+          {
             "key": "only_overlaid",
             "label": "Only posters Kometa has overlaid",
-            "description": "When on, only items carrying Kometa's \"Overlay\" label in Plex are synced. Turn off to sync every movie and series poster in the selected libraries.",
+            "description": "Applies to movie and series posters only. When on, only items carrying Kometa's \"Overlay\" label in Plex have their poster synced; turn off to sync every poster in the selected libraries. Backdrops, logos and season posters are not filtered by this label.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": true
           },
@@ -160,6 +188,13 @@
             "label": "Sync Plex collections",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": true
+          },
+          {
+            "key": "sync_collection_backdrops",
+            "label": "Sync collection backdrops",
+            "description": "Copies the backdrop of each Plex collection this plugin manages. Needs \"Sync Plex collections\". Off by default.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
           },
           {
             "key": "delete_removed_collections",

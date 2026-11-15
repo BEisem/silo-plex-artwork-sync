@@ -42,7 +42,12 @@ type plexItem struct {
 	Title     string `json:"title"`
 	Type      string `json:"type"` // "movie", "show", "collection", ...
 	Thumb     string `json:"thumb"`
+	Art       string `json:"art"`   // the selected backdrop
+	Index     *int   `json:"index"` // season number on a season
 	Year      int    `json:"year"`
+	// Image lists the item's currently selected artwork by type ("coverPoster",
+	// "background", "clearLogo"). Plex only lists what is set.
+	Images []plexImage `json:"Image"`
 	// Plex sends both "guid" (one string, e.g. plex://movie/...) and "Guid"
 	// (the external ID list). encoding/json matches keys case-insensitively,
 	// so "guid" needs its own field or it would be decoded into GUIDs.
@@ -61,6 +66,22 @@ func (i plexItem) tmdbID() string {
 		}
 	}
 	return ""
+}
+
+type plexImage struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+}
+
+// clearLogo returns the path of the item's selected clear logo, and whether
+// the listing reported the item's image list at all.
+func (i plexItem) clearLogo() (path string, listed bool) {
+	for _, im := range i.Images {
+		if im.Type == "clearLogo" {
+			return im.URL, true
+		}
+	}
+	return "", len(i.Images) > 0
 }
 
 type plexDirectory struct {
@@ -235,8 +256,8 @@ func (p *PlexClient) CollectionChildren(ctx context.Context, ratingKey string) (
 
 // Image downloads an image path such as /library/metadata/123/thumb/1698000000.
 func (p *PlexClient) Image(ctx context.Context, thumbPath string) ([]byte, error) {
-	if !strings.HasPrefix(thumbPath, "/") {
-		return nil, fmt.Errorf("unexpected thumb path %q", thumbPath)
+	if !isPlexPath(thumbPath) {
+		return nil, fmt.Errorf("unexpected image path %q", thumbPath)
 	}
 	req, err := p.newRequest(ctx, thumbPath, nil)
 	if err != nil {
@@ -252,4 +273,56 @@ func (p *PlexClient) Image(ctx context.Context, thumbPath string) ([]byte, error
 		return nil, fmt.Errorf("plex image %s: HTTP %d", thumbPath, resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 40<<20))
+}
+
+// Seasons lists a show's seasons (never its episodes). Season 0 is Specials.
+func (p *PlexClient) Seasons(ctx context.Context, showRatingKey string) ([]plexItem, error) {
+	items, err := p.paged(ctx, "/library/metadata/"+url.PathEscape(showRatingKey)+"/children", nil)
+	if err != nil {
+		return nil, err
+	}
+	out := items[:0]
+	for _, it := range items {
+		if it.Type == "season" && it.Index != nil {
+			out = append(out, it)
+		}
+	}
+	return out, nil
+}
+
+// plexLogoChoice is one entry of /library/metadata/{id}/clearLogos.
+type plexLogoChoice struct {
+	Key      string `json:"key"`
+	Selected bool   `json:"selected"`
+}
+
+// SelectedClearLogo asks Plex which clear logo is selected for an item. It is
+// the fallback for servers whose listings omit the Image array. ok is false
+// when no logo, or more than one, is marked selected, or when the selected
+// one is not a local Plex path: the plugin never guesses.
+func (p *PlexClient) SelectedClearLogo(ctx context.Context, ratingKey string) (path string, ok bool, err error) {
+	var c struct {
+		MediaContainer struct {
+			Metadata []plexLogoChoice `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := p.getJSON(ctx, "/library/metadata/"+url.PathEscape(ratingKey)+"/clearLogos", nil, nil, &c); err != nil {
+		return "", false, err
+	}
+	var sel []string
+	for _, l := range c.MediaContainer.Metadata {
+		if l.Selected {
+			sel = append(sel, l.Key)
+		}
+	}
+	if len(sel) != 1 || !isPlexPath(sel[0]) {
+		return "", false, nil
+	}
+	return sel[0], true, nil
+}
+
+// isPlexPath accepts only server-relative paths, so a download never follows
+// a URL to another host.
+func isPlexPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") && !strings.Contains(path, "://")
 }

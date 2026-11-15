@@ -36,6 +36,9 @@ var errConflict = errors.New("conflict in Silo")
 // reading its ETag and writing with If-Match.
 var errStale = errors.New("changed in Silo since it was read")
 
+// errTooLarge is returned when Silo answers 413 (image over its size limit).
+var errTooLarge = errors.New("image too large for Silo")
+
 // errOrderTooLarge means a collection holds more titles than Silo lets a
 // client reorder in one request.
 var errOrderTooLarge = errors.New("collection is too large to reorder")
@@ -56,6 +59,9 @@ type SiloClient struct {
 	apiKey  string
 	http    *http.Client
 	pace    *pacer
+
+	profileMu sync.Mutex
+	profileID string // primary profile, for the profile-scoped season list
 }
 
 const (
@@ -131,6 +137,7 @@ type request struct {
 	ifMatch      string
 	out          any
 	etag         *string
+	headers      map[string]string
 }
 
 func (s *SiloClient) do(ctx context.Context, r request) error {
@@ -150,6 +157,9 @@ func (s *SiloClient) do(ctx context.Context, r request) error {
 		req.Header.Set("Accept", "application/json, application/problem+json")
 		if r.contentType != "" {
 			req.Header.Set("Content-Type", r.contentType)
+		}
+		for k, v := range r.headers {
+			req.Header.Set(k, v)
 		}
 		if r.ifMatch != "" {
 			req.Header.Set("If-Match", r.ifMatch)
@@ -246,6 +256,10 @@ func (s *SiloClient) doJSON(ctx context.Context, method, path string, payload, o
 // multipartImage builds a form with the image under field (plus any plain
 // text fields).
 func multipartImage(field string, data []byte, extra map[string]string) (string, []byte, error) {
+	filename := "poster"
+	if t := extra["type"]; t != "" {
+		filename = t
+	}
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	for k, v := range extra {
@@ -254,7 +268,7 @@ func multipartImage(field string, data []byte, extra map[string]string) (string,
 		}
 	}
 	header := textproto.MIMEHeader{}
-	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename="poster"`, field))
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename=%q`, field, filename))
 	header.Set("Content-Type", sniffImageType(data))
 	part, err := w.CreatePart(header)
 	if err != nil {
@@ -278,12 +292,85 @@ func (s *SiloClient) UploadPoster(ctx context.Context, contentID string, data []
 	if err != nil {
 		return err
 	}
-	ct, body, err := multipartImage("image", data, map[string]string{"type": "poster"})
+	return s.UploadItemImage(ctx, contentID, "poster", data)
+}
+
+// UploadItemImage uploads an image of siloType ("poster", "backdrop" or
+// "logo") through POST /admin/items/{id}/images/upload. Silo replaces only the
+// image of that type, so the item's other artwork is left as it was. Movies
+// and series accept all three types; seasons accept only "poster". The data
+// must already fit Silo's limits (see fitArtwork). The upload is not
+// idempotent on Silo's side, so only a 429 (not processed) is retried.
+func (s *SiloClient) UploadItemImage(ctx context.Context, contentID, siloType string, data []byte) error {
+	ct, body, err := multipartImage("image", data, map[string]string{"type": siloType})
 	if err != nil {
 		return err
 	}
 	return s.do(ctx, request{method: http.MethodPost, path: "/admin/items/" + url.PathEscape(contentID) + "/images/upload",
 		contentType: ct, body: body})
+}
+
+// siloSeason is one season of a Silo series.
+type siloSeason struct {
+	ContentID    string `json:"content_id"`
+	SeasonNumber int    `json:"season_number"`
+}
+
+// SeriesSeasons maps season numbers to the season content IDs Silo holds for
+// a series. Silo serves the list only to a profile (GET
+// /catalog/series/{id}/seasons is profile scoped), so the call acts as the
+// API key owner's primary profile; an admin API key skips the profile PIN.
+// Seasons are never created: a number missing from the map is not in Silo.
+func (s *SiloClient) SeriesSeasons(ctx context.Context, seriesID string) (map[int]string, error) {
+	profile, err := s.actingProfile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Items []siloSeason `json:"items"`
+	}
+	err = s.do(ctx, request{method: http.MethodGet,
+		path:    "/catalog/series/" + url.PathEscape(seriesID) + "/seasons?include_artwork=false",
+		headers: map[string]string{"X-Profile-Id": profile}, out: &out})
+	if err != nil {
+		return nil, err
+	}
+	seasons := make(map[int]string, len(out.Items))
+	for _, it := range out.Items {
+		if it.ContentID == "" {
+			return nil, fmt.Errorf("silo seasons of %s: a season has no content_id", seriesID)
+		}
+		if _, dup := seasons[it.SeasonNumber]; dup {
+			return nil, fmt.Errorf("silo seasons of %s: season %d listed twice", seriesID, it.SeasonNumber)
+		}
+		seasons[it.SeasonNumber] = it.ContentID
+	}
+	return seasons, nil
+}
+
+// actingProfile returns the API key owner's primary profile, read once.
+func (s *SiloClient) actingProfile(ctx context.Context) (string, error) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	if s.profileID != "" {
+		return s.profileID, nil
+	}
+	var out struct {
+		Items []struct {
+			ID        string `json:"id"`
+			IsPrimary bool   `json:"is_primary"`
+		} `json:"items"`
+	}
+	if err := s.doJSON(ctx, http.MethodGet, "/profiles", nil, &out); err != nil {
+		return "", fmt.Errorf("read profiles for the season list: %w", err)
+	}
+	for _, p := range out.Items {
+		if p.IsPrimary && p.ID != "" {
+			s.profileID = p.ID
+			return p.ID, nil
+		}
+	}
+	return "", errors.New("the API key's account has no primary profile, so Silo's season list cannot be read")
 }
 
 // siloCollectionInfo is one entry of Silo's admin collection list.
@@ -404,11 +491,26 @@ func (s *SiloClient) SetCollectionPoster(ctx context.Context, id string, poster 
 	if err != nil {
 		return err
 	}
-	ct, body, err := multipartImage("image", poster, nil)
+	return s.setCollectionImage(ctx, id, "poster", poster)
+}
+
+// SetCollectionBackdrop uploads a collection's backdrop (PUT
+// /admin/collections/{id}/backdrop). It leaves the poster, members and
+// definition alone.
+func (s *SiloClient) SetCollectionBackdrop(ctx context.Context, id string, backdrop []byte) error {
+	backdrop, err := fitArtwork(ArtCollectionBackdrop, backdrop)
 	if err != nil {
 		return err
 	}
-	return s.do(ctx, request{method: http.MethodPut, path: "/admin/collections/" + url.PathEscape(id) + "/poster",
+	return s.setCollectionImage(ctx, id, "backdrop", backdrop)
+}
+
+func (s *SiloClient) setCollectionImage(ctx context.Context, id, kind string, data []byte) error {
+	ct, body, err := multipartImage("image", data, nil)
+	if err != nil {
+		return err
+	}
+	return s.do(ctx, request{method: http.MethodPut, path: "/admin/collections/" + url.PathEscape(id) + "/" + kind,
 		contentType: ct, body: body})
 }
 

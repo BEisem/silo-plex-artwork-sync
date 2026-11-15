@@ -312,11 +312,20 @@ var statusPage = template.Must(template.New("status").Funcs(template.FuncMap{"nu
     <div class="stat"><div class="n">{{num .NotInSilo}}</div><div class="l">Not in Silo</div></div>
     <div class="stat"><div class="n">{{num .NoTMDBID}}</div><div class="l">No TMDB id</div></div>
     {{if .DuplicatesSkipped}}<div class="stat"><div class="n">{{num .DuplicatesSkipped}}</div><div class="l">Copies in other libraries</div></div>{{end}}
+    {{if .BackdropsApplied}}<div class="stat"><div class="n">{{num .BackdropsApplied}}</div><div class="l">Backdrops {{if .DryRun}}to apply{{else}}applied{{end}}</div></div>{{end}}
+    {{if .LogosApplied}}<div class="stat"><div class="n">{{num .LogosApplied}}</div><div class="l">Logos {{if .DryRun}}to apply{{else}}applied{{end}}</div></div>{{end}}
+    {{if .SeasonPostersApplied}}<div class="stat"><div class="n">{{num .SeasonPostersApplied}}</div><div class="l">Season posters {{if .DryRun}}to apply{{else}}applied{{end}}</div></div>{{end}}
+    {{if .CollectionBackdropsApplied}}<div class="stat"><div class="n">{{num .CollectionBackdropsApplied}}</div><div class="l">Collection backdrops {{if .DryRun}}to apply{{else}}applied{{end}}</div></div>{{end}}
+    {{if .ArtworkUnchanged}}<div class="stat"><div class="n">{{num .ArtworkUnchanged}}</div><div class="l">Other artwork unchanged</div></div>{{end}}
+    {{if .ArtworkMissing}}<div class="stat"><div class="n">{{num .ArtworkMissing}}</div><div class="l">Artwork not set in Plex</div></div>{{end}}
+    {{if .LogosUndetermined}}<div class="stat"><div class="n">{{num .LogosUndetermined}}</div><div class="l">Logos with no clear selection</div></div>{{end}}
+    {{if .SeasonsNotInSilo}}<div class="stat"><div class="n">{{num .SeasonsNotInSilo}}</div><div class="l">Seasons not in Silo</div></div>{{end}}
     {{if .CollectionsChecked}}<div class="stat"><div class="n">{{num .CollectionsChecked}}</div><div class="l">Collections checked</div></div>{{end}}
     <div class="stat"><div class="n">{{num .CollectionsCreated}} / {{num .CollectionsUpdated}}</div><div class="l">Collections created / updated</div></div>{{end}}
     <div class="stat"><div class="n">{{num .CollectionsDeleted}}</div><div class="l">Collections deleted</div></div>
     <div class="stat{{if .ErrorCount}} bad{{end}}"><div class="n">{{num .ErrorCount}}</div><div class="l">Errors</div></div>
   </div>
+  {{if .ErrorsByType}}<p class="meta">Errors by artwork: {{range $t, $n := .ErrorsByType}}{{$t}} {{num $n}} · {{end}}</p>{{end}}
   {{if .Errors}}<details{{if le (len .Errors) 3}} open{{end}}><summary>Show errors{{if gt .ErrorCount (len .Errors)}} (first {{len .Errors}} of {{.ErrorCount}}){{end}}</summary>
     <ul class="errors">{{range .Errors}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
   {{else}}<p class="empty">No runs yet. Use Run now on the Plex Artwork Sync task in Silo's scheduled tasks, or wait for Kometa's next run if you use the webhook.</p>{{end}}
@@ -356,13 +365,13 @@ var statusPage = template.Must(template.New("status").Funcs(template.FuncMap{"nu
 <section class="card">
   <h2>Revert</h2>
   {{if .Tracked}}
-  <p class="desc">Puts the posters this plugin applied back to Silo's default and stops tracking them. For each item it removes only the image lock, keeping any other locks you set, then runs Silo's own metadata refresh, a few at a time.</p>
+  <p class="desc">Puts the artwork this plugin applied back to Silo's default and stops tracking it. Silo has one image lock per item and no per-type reset, so an item's poster, backdrop and logo are reverted together; a season poster is reverted on its season. For each item it removes only the image lock, keeping any other locks you set, then runs Silo's own metadata refresh, a few at a time.</p>
   <div class="callout">Untick the library under <strong>Libraries</strong> and save first, or the next sync pushes the posters again.</div>
   <form method="post" action="revert">
     <input type="hidden" name="token" value="{{.FormToken}}">
-    <table><thead><tr><th style="width:2rem"></th><th>Library</th><th class="num">Posters</th><th class="num">Collections</th></tr></thead><tbody>
+    <table><thead><tr><th style="width:2rem"></th><th>Library</th><th class="num">Posters</th><th class="num">Other artwork</th><th class="num">Collections</th></tr></thead><tbody>
     {{range .Tracked}}<tr><td><input type="checkbox" name="library" value="{{.ID}}" id="lib-{{.ID}}"></td>
-      <td><label for="lib-{{.ID}}">{{.Title}}</label></td><td class="num">{{num .Posters}}</td><td class="num">{{num .Collections}}</td></tr>{{end}}
+      <td><label for="lib-{{.ID}}">{{.Title}}</label></td><td class="num">{{num .Posters}}</td><td class="num">{{num .Artwork}}</td><td class="num">{{num .Collections}}</td></tr>{{end}}
     </tbody></table>
     <label class="opt"><input type="checkbox" name="delete_collections"><span>Also delete the Silo collections this plugin created for these libraries</span></label>
     <label class="opt"><input type="checkbox" name="confirm"><span>I understand this resets these posters in Silo</span></label>

@@ -184,6 +184,9 @@ func (p *plugin) runSync(ctx context.Context, trigger string) (*runSummary, erro
 		summary.Errors = append(summary.Errors, err.Error())
 	}
 	p.log.Info("sync finished", "trigger", trigger, "posters_applied", summary.PostersApplied,
+		"backdrops_applied", summary.BackdropsApplied, "logos_applied", summary.LogosApplied,
+		"season_posters_applied", summary.SeasonPostersApplied, "collection_backdrops_applied", summary.CollectionBackdropsApplied,
+		"artwork_unchanged", summary.ArtworkUnchanged, "seasons_not_in_silo", summary.SeasonsNotInSilo,
 		"unchanged", summary.PostersUnchanged, "not_in_silo", summary.NotInSilo,
 		"collections_created", summary.CollectionsCreated, "collections_updated", summary.CollectionsUpdated,
 		"collections_deleted", summary.CollectionsDeleted, "errors", summary.ErrorCount)

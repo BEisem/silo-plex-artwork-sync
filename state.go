@@ -16,6 +16,7 @@ import (
 const (
 	posterShards     = 32
 	collectionShards = 64
+	artworkShards    = 32 // backdrops, logos and season posters
 	maxStateValue    = 250 << 10
 )
 
@@ -30,6 +31,7 @@ type collectionRecord struct {
 	Title    string   `json:"title,omitempty"`
 	Libs     []int    `json:"libs,omitempty"`
 	Thumb    string   `json:"thumb,omitempty"`
+	Art      string   `json:"art,omitempty"`      // backdrop path last uploaded
 	Members  []string `json:"members,omitempty"`  // Silo content IDs this plugin added
 	Sections []string `json:"sections,omitempty"` // Plex libraries it draws on; first supplies the poster
 	Order    []string `json:"order,omitempty"`    // member order last sent to Silo
@@ -37,25 +39,36 @@ type collectionRecord struct {
 
 // runSummary is persisted so the status page survives plugin restarts.
 type runSummary struct {
-	StartedAt          string   `json:"started_at"`
-	FinishedAt         string   `json:"finished_at,omitempty"`
-	Trigger            string   `json:"trigger"`
-	DryRun             bool     `json:"dry_run,omitempty"`
-	PlexItems          int      `json:"plex_items"`
-	PostersApplied     int      `json:"posters_applied"`
-	PostersUnchanged   int      `json:"posters_unchanged"`
-	NotInSilo          int      `json:"not_in_silo"`
-	NoTMDBID           int      `json:"no_tmdb_id"`
-	CollectionsCreated int      `json:"collections_created"`
-	CollectionsUpdated int      `json:"collections_updated"`
-	CollectionsDeleted int      `json:"collections_deleted"`
-	PostersReverted    int      `json:"posters_reverted,omitempty"`
-	Cancelled          bool     `json:"cancelled,omitempty"`
-	Note               string   `json:"note,omitempty"`
-	DuplicatesSkipped  int      `json:"duplicates_skipped,omitempty"`
-	CollectionsChecked int      `json:"collections_checked,omitempty"`
-	Errors             []string `json:"errors,omitempty"`
-	ErrorCount         int      `json:"error_count"`
+	StartedAt          string `json:"started_at"`
+	FinishedAt         string `json:"finished_at,omitempty"`
+	Trigger            string `json:"trigger"`
+	DryRun             bool   `json:"dry_run,omitempty"`
+	PlexItems          int    `json:"plex_items"`
+	PostersApplied     int    `json:"posters_applied"`
+	PostersUnchanged   int    `json:"posters_unchanged"`
+	NotInSilo          int    `json:"not_in_silo"`
+	NoTMDBID           int    `json:"no_tmdb_id"`
+	CollectionsCreated int    `json:"collections_created"`
+	CollectionsUpdated int    `json:"collections_updated"`
+	CollectionsDeleted int    `json:"collections_deleted"`
+	PostersReverted    int    `json:"posters_reverted,omitempty"`
+	Cancelled          bool   `json:"cancelled,omitempty"`
+	Note               string `json:"note,omitempty"`
+	DuplicatesSkipped  int    `json:"duplicates_skipped,omitempty"`
+
+	// Artwork beyond movie and series posters (absent on 0.5.0 summaries).
+	BackdropsApplied           int            `json:"backdrops_applied,omitempty"`
+	LogosApplied               int            `json:"logos_applied,omitempty"`
+	SeasonPostersApplied       int            `json:"season_posters_applied,omitempty"`
+	CollectionBackdropsApplied int            `json:"collection_backdrops_applied,omitempty"`
+	ArtworkUnchanged           int            `json:"artwork_unchanged,omitempty"`
+	ArtworkMissing             int            `json:"artwork_missing,omitempty"`    // nothing selected in Plex
+	LogosUndetermined          int            `json:"logos_undetermined,omitempty"` // selection not identifiable
+	SeasonsNotInSilo           int            `json:"seasons_not_in_silo,omitempty"`
+	ErrorsByType               map[string]int `json:"errors_by_type,omitempty"`
+	CollectionsChecked         int            `json:"collections_checked,omitempty"`
+	Errors                     []string       `json:"errors,omitempty"`
+	ErrorCount                 int            `json:"error_count"`
 }
 
 type metaState struct {
@@ -67,8 +80,10 @@ type stateStore struct {
 	io          stateIO
 	posters     [posterShards]map[string]string
 	collections [collectionShards]map[string]*collectionRecord
+	artwork     [artworkShards]map[string]string
 	dirtyP      [posterShards]bool
 	dirtyC      [collectionShards]bool
+	dirtyA      [artworkShards]bool
 }
 
 func shardOf(key string, n int) int {
@@ -88,6 +103,12 @@ func loadState(ctx context.Context, io stateIO) (*stateStore, error) {
 	for i := range collectionShards {
 		s.collections[i] = map[string]*collectionRecord{}
 		if err := s.read(ctx, fmt.Sprintf("collections/%02d", i), &s.collections[i]); err != nil {
+			return nil, err
+		}
+	}
+	for i := range artworkShards {
+		s.artwork[i] = map[string]string{}
+		if err := s.read(ctx, fmt.Sprintf("artwork/%02d", i), &s.artwork[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -149,6 +170,42 @@ func (s *stateStore) posterKeys(prefix string) []string {
 	return keys
 }
 
+// Artwork other than movie and series posters is kept apart from the poster
+// shards, so posters recorded by 0.5.0 keep their keys and values and are not
+// pushed again. Keys are "<section>/<ratingKey>/<type>" (season posters:
+// "<section>/<showRatingKey>/season/<n>").
+func (s *stateStore) artworkVal(key string) string {
+	return s.artwork[shardOf(key, artworkShards)][key]
+}
+
+func (s *stateStore) setArtwork(key, val string) {
+	i := shardOf(key, artworkShards)
+	s.artwork[i][key] = val
+	s.dirtyA[i] = true
+}
+
+func (s *stateStore) deleteArtwork(key string) {
+	i := shardOf(key, artworkShards)
+	if _, ok := s.artwork[i][key]; ok {
+		delete(s.artwork[i], key)
+		s.dirtyA[i] = true
+	}
+}
+
+// artworkKeys returns tracked artwork keys that start with prefix.
+func (s *stateStore) artworkKeys(prefix string) []string {
+	var keys []string
+	for i := range artworkShards {
+		for k := range s.artwork[i] {
+			if strings.HasPrefix(k, prefix) {
+				keys = append(keys, k)
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func (s *stateStore) collection(key string) *collectionRecord {
 	return s.collections[shardOf(key, collectionShards)][key]
 }
@@ -188,6 +245,14 @@ func (s *stateStore) flush(ctx context.Context) error {
 				return err
 			}
 			s.dirtyP[i] = false
+		}
+	}
+	for i := range artworkShards {
+		if s.dirtyA[i] {
+			if err := s.write(ctx, fmt.Sprintf("artwork/%02d", i), s.artwork[i]); err != nil {
+				return err
+			}
+			s.dirtyA[i] = false
 		}
 	}
 	for i := range collectionShards {
