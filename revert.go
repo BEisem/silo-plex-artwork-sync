@@ -12,7 +12,12 @@ import (
 	"time"
 )
 
-// Revert undoes this plugin's changes for chosen Plex libraries. Silo has no
+// Revert undoes this plugin's changes for chosen Plex libraries. Silo keeps
+// one image lock per item, shared by its poster, backdrop and logo, and a
+// refresh re-picks all three; Silo has no per-type reset. So an item is
+// reverted as a whole: every artwork type the plugin uploaded to it goes
+// back to Silo's default together, and is forgotten together. A season
+// poster is reverted the same way on the season item. Silo has no
 // bulk "reset artwork" action, and the image lock Silo sets on apply makes
 // library refreshes skip these items, so each item is reverted on its own:
 //
@@ -37,6 +42,7 @@ type trackedSection struct {
 	ID          string
 	Title       string
 	Posters     int
+	Artwork     int // backdrops, logos and season posters
 	Collections int
 }
 
@@ -57,6 +63,10 @@ func trackedSections(state *stateStore, titles map[string]string) []trackedSecti
 	for _, key := range state.posterKeys("") {
 		id, _, _ := strings.Cut(key, "/")
 		get(id).Posters++
+	}
+	for _, key := range state.artworkKeys("") {
+		id, _, _ := strings.Cut(key, "/")
+		get(id).Artwork++
 	}
 	for _, key := range state.collectionKeys() {
 		if !isCombinedKey(key) {
@@ -107,14 +117,26 @@ func (r *reverter) run(ctx context.Context, sections map[string]bool, deleteColl
 	// and "Movies 4k" is one Silo item, so reverting it clears both entries;
 	// a library still being synced pushes its poster again on the next run.
 	keysByItem := map[string][]string{}
+	artByItem := map[string][]string{}
 	for _, key := range r.state.posterKeys("") {
 		if _, contentID, _ := strings.Cut(r.state.posterThumb(key), "|"); contentID != "" {
 			keysByItem[contentID] = append(keysByItem[contentID], key)
 		}
 	}
+	for _, key := range r.state.artworkKeys("") {
+		if target := uploadTarget(r.state.artworkVal(key)); target != "" {
+			artByItem[target] = append(artByItem[target], key)
+			if _, ok := keysByItem[target]; !ok {
+				keysByItem[target] = nil
+			}
+		}
+	}
+	allKeys := func(contentID string) []string {
+		return append(slices.Clone(keysByItem[contentID]), artByItem[contentID]...)
+	}
 	var items []string
-	for contentID, keys := range keysByItem {
-		if slices.ContainsFunc(keys, func(key string) bool {
+	for contentID := range keysByItem {
+		if slices.ContainsFunc(allKeys(contentID), func(key string) bool {
 			section, _, _ := strings.Cut(key, "/")
 			return sections[section]
 		}) {
@@ -141,6 +163,9 @@ func (r *reverter) run(ctx context.Context, sections map[string]bool, deleteColl
 				r.mu.Lock()
 				for _, key := range keysByItem[contentID] {
 					r.state.deletePoster(key)
+				}
+				for _, key := range artByItem[contentID] {
+					r.state.deleteArtwork(key)
 				}
 				r.summary.PostersReverted++
 				flush := r.summary.PostersReverted%flushEvery == 0

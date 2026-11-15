@@ -145,7 +145,7 @@ func (s *syncer) run(ctx context.Context) error {
 		return nil
 	}
 
-	var cands []posterCandidate
+	var cands, extraCands []posterCandidate
 	var unlabeled []posterJob
 	s.progress.set("Reading Plex libraries", len(wanted))
 	for i, sec := range wanted {
@@ -153,7 +153,7 @@ func (s *syncer) run(ctx context.Context) error {
 			return err
 		}
 		s.progress.detailf(sec.Title)
-		c, u, err := s.collectPosters(ctx, sec, i)
+		c, u, x, err := s.collectPosters(ctx, sec, i)
 		s.progress.add(1)
 		if err != nil {
 			s.addError("posters in %q: %v", sec.Title, err)
@@ -161,6 +161,7 @@ func (s *syncer) run(ctx context.Context) error {
 		}
 		cands = append(cands, c...)
 		unlabeled = append(unlabeled, u...)
+		extraCands = append(extraCands, x...)
 	}
 	policy := s.policy
 	if policy == "" {
@@ -168,14 +169,20 @@ func (s *syncer) run(ctx context.Context) error {
 	}
 	migration := "winner:" + policy
 	forceShared := !s.state.migrated(ctx, migration)
-	applyErr := s.applyPosters(ctx, s.pickPosters(cands, unlabeled, forceShared))
+	var applyErr error
+	if !s.cfg.NoPosters {
+		applyErr = s.applyPosters(ctx, s.pickPosters(cands, unlabeled, forceShared))
+	}
+	if applyErr == nil && s.cfg.wantsItemExtras() {
+		applyErr = s.syncItemArtwork(ctx, extraCands)
+	}
 	if err := s.state.flush(ctx); err != nil {
 		return err
 	}
 	if applyErr != nil {
 		return applyErr
 	}
-	if forceShared && !s.cfg.DryRun && s.summary.ErrorCount == 0 {
+	if forceShared && !s.cfg.NoPosters && !s.cfg.DryRun && s.summary.ErrorCount == 0 {
 		if err := s.state.markMigrated(ctx, migration); err != nil {
 			s.addError("save migration: %v", err)
 		}
@@ -240,6 +247,7 @@ func posterKey(sec plexSection, ratingKey string) string {
 // posterCandidate is one Plex item that maps to a Silo movie or series.
 type posterCandidate struct {
 	job     posterJob
+	sec     plexSection
 	rank    int  // higher resolution wins when two libraries share a Silo item
 	order   int  // Plex library order, the tiebreak
 	changed bool // its poster differs from what was last pushed for it
@@ -290,15 +298,55 @@ func itemRank(sec plexSection, it plexItem) int {
 }
 
 // collectPosters lists a library's candidates without applying anything.
-func (s *syncer) collectPosters(ctx context.Context, sec plexSection, order int) ([]posterCandidate, []posterJob, error) {
+//
+// Kometa's Overlay label filters posters only. Backdrops, logos and season
+// posters (extras) are taken from every item in the library, since Kometa
+// labels only what it overlays. extras is nil when no extra type is on.
+func (s *syncer) collectPosters(ctx context.Context, sec plexSection, order int) (posters []posterCandidate, unlabeled []posterJob, extras []posterCandidate, err error) {
 	label := ""
-	if s.cfg.OnlyOverlaid {
+	if s.cfg.OnlyOverlaid && !s.cfg.NoPosters {
 		label = overlayLabel
 	}
-	items, err := s.plex.Items(ctx, sec, label)
-	if err != nil {
-		return nil, nil, err
+	var items []plexItem
+	if !s.cfg.NoPosters {
+		if items, err = s.plex.Items(ctx, sec, label); err != nil {
+			return nil, nil, nil, err
+		}
+		all, err := s.candidates(ctx, sec, order, items, true)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		// An item without a poster takes no part in choosing posters, as
+		// before; it can still have a backdrop or logo.
+		for _, c := range all {
+			if c.job.item.Thumb != "" {
+				posters = append(posters, c)
+			}
+		}
+		if label == "" {
+			extras = all
+		}
+		if label != "" {
+			unlabeled = s.unlabeledJobs(ctx, sec, items)
+		}
 	}
+	if !s.cfg.wantsItemExtras() {
+		return posters, unlabeled, nil, nil
+	}
+	if !s.cfg.NoPosters && label == "" {
+		return posters, unlabeled, extras, nil
+	}
+	all, err := s.plex.Items(ctx, sec, "")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	extras, err = s.candidates(ctx, sec, order, all, s.cfg.NoPosters)
+	return posters, unlabeled, extras, err
+}
+
+// candidates matches a library's items to Silo. count adds them to the
+// item counters, which describe one listing per library.
+func (s *syncer) candidates(ctx context.Context, sec plexSection, order int, items []plexItem, count bool) ([]posterCandidate, error) {
 
 	var ids []string
 	for _, it := range items {
@@ -308,24 +356,27 @@ func (s *syncer) collectPosters(ctx context.Context, sec plexSection, order int)
 	}
 	matches, err := s.lookup(ctx, mediaTypeFor(sec), ids)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	var out []posterCandidate
 	s.mu.Lock()
-	s.summary.PlexItems += len(items)
+	if count {
+		s.summary.PlexItems += len(items)
+	}
 	for _, it := range items {
 		tmdb := it.tmdbID()
-		switch {
-		case tmdb == "":
-			s.summary.NoTMDBID++
-			continue
-		case it.Thumb == "":
+		if tmdb == "" {
+			if count {
+				s.summary.NoTMDBID++
+			}
 			continue
 		}
 		match, ok := matches[tmdb]
 		if !ok || match.MediaID == "" {
-			s.summary.NotInSilo++
+			if count {
+				s.summary.NotInSilo++
+			}
 			continue
 		}
 		// The thumb path ends in an upload timestamp, so it changes whenever
@@ -334,18 +385,51 @@ func (s *syncer) collectPosters(ctx context.Context, sec plexSection, order int)
 		val := it.Thumb + "|" + match.MediaID
 		out = append(out, posterCandidate{
 			job:     posterJob{item: it, contentID: match.MediaID, mediaType: mediaTypeFor(sec), tmdb: tmdb, stateKey: key, stateVal: val},
+			sec:     sec,
 			rank:    s.rankOf(sec, it),
 			order:   order,
 			changed: s.state.posterThumb(key) != val,
 		})
 	}
 	s.mu.Unlock()
+	return out, nil
+}
 
-	var unlabeled []posterJob
-	if s.cfg.OnlyOverlaid {
-		unlabeled = s.unlabeledJobs(ctx, sec, items)
+// syncItemArtwork copies backdrops, logos and season posters from the winning
+// copy of each Silo item, as chosen for posters.
+func (s *syncer) syncItemArtwork(ctx context.Context, cands []posterCandidate) error {
+	winners := s.winners(cands)
+	s.progress.set("Checking artwork", len(winners))
+	var jobs []ArtworkJob
+	if s.cfg.SyncBackdrops || s.cfg.SyncLogos {
+		jobs = append(jobs, s.planItemArtwork(ctx, winners)...)
 	}
-	return out, unlabeled, nil
+	if s.cfg.SyncSeasonPosters {
+		jobs = append(jobs, s.planSeasonPosters(ctx, winners)...)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.applyArtwork(ctx, jobs)
+}
+
+// winners picks, per Silo item, the copy whose artwork is used: the highest
+// ranked, then the earliest library.
+func (s *syncer) winners(cands []posterCandidate) []posterCandidate {
+	byItem := map[string]int{}
+	var out []posterCandidate
+	for _, c := range cands {
+		i, ok := byItem[c.job.contentID]
+		if !ok {
+			byItem[c.job.contentID] = len(out)
+			out = append(out, c)
+			continue
+		}
+		if w := out[i]; c.rank > w.rank || (c.rank == w.rank && c.order < w.order) {
+			out[i] = c
+		}
+	}
+	return out
 }
 
 // pickPosters decides what to push when several Plex libraries hold the same

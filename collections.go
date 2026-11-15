@@ -412,18 +412,25 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 	winner := spec.parts[0].coll
 	wantPoster := winner.Thumb != "" && !strings.Contains(winner.Thumb, "/composite/")
 	posterChanged := wantPoster && (rec == nil || rec.Thumb != winner.Thumb)
+	// The backdrop is tracked on its own: a changed backdrop re-uploads only
+	// the backdrop, and a collection without one in Plex keeps Silo's.
+	wantArt := s.cfg.SyncCollectionBackdrops && winner.Art != "" && !isComposite(winner.Art)
+	artChanged := wantArt && (rec == nil || rec.Art != winner.Art)
 	added, removed := diffMembers(desired, recMembers(rec))
 	if adopted {
 		added, removed = desired, nil
 	}
 
 	if s.cfg.DryRun {
-		s.log("dry run: collection", "title", spec.title, "exists", rec != nil, "add", len(added), "remove", len(removed), "poster_changed", posterChanged)
+		s.log("dry run: collection", "title", spec.title, "exists", rec != nil, "add", len(added), "remove", len(removed), "poster_changed", posterChanged, "backdrop_changed", artChanged)
 		s.mu.Lock()
 		if rec == nil {
 			s.summary.CollectionsCreated++
 		} else if posterChanged || adopted || len(added)+len(removed) > 0 {
 			s.summary.CollectionsUpdated++
+		}
+		if artChanged {
+			s.summary.CollectionBackdropsApplied++
 		}
 		s.mu.Unlock()
 		return nil
@@ -479,6 +486,14 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 			poster = nil
 		default:
 			rec.Thumb = winner.Thumb
+		}
+	}
+	if artChanged {
+		switch err := s.syncCollectionBackdrop(ctx, spec.title, rec, winner); {
+		case errors.Is(err, errNotFound):
+			return gone(err)
+		case err != nil:
+			s.artworkError(ArtCollectionBackdrop, "collection %q: %v", spec.title, err)
 		}
 	}
 	rec.Title, rec.Libs, rec.Sections = spec.title, libs, spec.sectionIDs()
@@ -576,6 +591,25 @@ func (s *syncer) syncCollection(ctx context.Context, spec collSpec) error {
 		s.summary.CollectionsUpdated++
 	}
 	s.mu.Unlock()
+	return nil
+}
+
+// syncCollectionBackdrop uploads the winning copy's backdrop and records it
+// on rec once Silo has accepted it.
+func (s *syncer) syncCollectionBackdrop(ctx context.Context, title string, rec *collectionRecord, winner plexItem) error {
+	data, err := s.plex.Image(ctx, winner.Art)
+	if err != nil {
+		return err
+	}
+	if err := s.silo.SetCollectionBackdrop(ctx, rec.SiloID, data); err != nil {
+		return err
+	}
+	rec.Art = winner.Art
+	s.mu.Lock()
+	s.summary.CollectionBackdropsApplied++
+	s.mu.Unlock()
+	s.log("artwork applied", "artwork_type", string(ArtCollectionBackdrop), "title", title, "plex_rating_key", winner.RatingKey,
+		"silo_item", rec.SiloID, "status", "applied")
 	return nil
 }
 
