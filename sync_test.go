@@ -403,7 +403,19 @@ func (f *fakeSilo) handler(t *testing.T) http.Handler {
 			delete(f.collTitle, id)
 			f.deleted = append(f.deleted, id)
 			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && path == "/profiles":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+				{"id": "7", "name": "Kid", "is_primary": false, "has_pin": false, "max_content_rating": "PG"},
+				{"id": "3", "name": "Admin", "is_primary": true, "has_pin": false, "max_content_rating": "", "max_advisory_age": nil, "library_restrictions_enabled": false},
+			}})
 		case r.Method == http.MethodGet && len(parts) == 3 && parts[0] == "catalog" && parts[1] == "items":
+			// As Silo: the catalog detail route is profile scoped.
+			if got := r.Header.Get("X-Profile-Id"); got != "3" {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"title":"Bad Request","detail":"The request did not pass validation; see errors.","errors":[{"location":"header.x-profile-id","detail":"The X-Profile-Id header is required."}]}`)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"content_id": parts[2], "locked_fields": f.locks[parts[2]]})
 		case r.Method == http.MethodPatch && len(parts) == 4 && parts[1] == "items" && parts[3] == "metadata":
 			f.writes++

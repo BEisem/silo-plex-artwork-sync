@@ -56,6 +56,11 @@ type SiloClient struct {
 	apiKey  string
 	http    *http.Client
 	pace    *pacer
+
+	// profileMu guards profileID, the household profile sent as X-Profile-Id
+	// on Silo's profile-scoped catalog reads. Looked up once, on first use.
+	profileMu sync.Mutex
+	profileID string
 }
 
 const (
@@ -129,6 +134,7 @@ type request struct {
 	contentType  string
 	body         []byte
 	ifMatch      string
+	profileID    string // X-Profile-Id, for profile-scoped (viewer) routes
 	out          any
 	etag         *string
 }
@@ -153,6 +159,9 @@ func (s *SiloClient) do(ctx context.Context, r request) error {
 		}
 		if r.ifMatch != "" {
 			req.Header.Set("If-Match", r.ifMatch)
+		}
+		if r.profileID != "" {
+			req.Header.Set("X-Profile-Id", r.profileID)
 		}
 		resp, err := s.http.Do(req)
 		if err != nil {
@@ -508,13 +517,71 @@ func (s *SiloClient) DeleteCollection(ctx context.Context, collectionID string) 
 // replacing it.
 const fieldImagesLock = 10
 
-// LockedFields returns the item's locked metadata fields.
+// LockedFields returns the item's locked metadata fields. Silo only exposes
+// them on the profile-scoped catalog detail route, which refuses a request
+// without X-Profile-Id (even from an admin API key), so the call declares the
+// account's primary profile.
 func (s *SiloClient) LockedFields(ctx context.Context, contentID string) ([]int, error) {
+	profileID, err := s.viewerProfile(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out struct {
 		LockedFields []int `json:"locked_fields"`
 	}
-	err := s.doJSON(ctx, http.MethodGet, "/catalog/items/"+url.PathEscape(contentID), nil, &out)
+	err = s.do(ctx, request{method: http.MethodGet, path: "/catalog/items/" + url.PathEscape(contentID), profileID: profileID, out: &out})
 	return out.LockedFields, err
+}
+
+// viewerProfile picks the profile to declare on catalog reads: the API key
+// account's primary profile, or the only profile a profile-bound key sees.
+// A PIN-locked or restricted profile is refused rather than used: the first
+// would need a profile token, and the second could hide items, which the
+// revert would then skip as already gone.
+func (s *SiloClient) viewerProfile(ctx context.Context) (string, error) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	if s.profileID != "" {
+		return s.profileID, nil
+	}
+	var out struct {
+		Items []struct {
+			ID                         string `json:"id"`
+			Name                       string `json:"name"`
+			HasPIN                     bool   `json:"has_pin"`
+			IsPrimary                  bool   `json:"is_primary"`
+			MaxContentRating           string `json:"max_content_rating"`
+			MaxAdvisoryAge             *int   `json:"max_advisory_age"`
+			LibraryRestrictionsEnabled bool   `json:"library_restrictions_enabled"`
+		} `json:"items"`
+	}
+	if err := s.doJSON(ctx, http.MethodGet, "/profiles", nil, &out); err != nil {
+		return "", fmt.Errorf("find a Silo profile: %w", err)
+	}
+	pick := -1
+	for i, p := range out.Items {
+		if p.IsPrimary {
+			pick = i
+			break
+		}
+	}
+	if pick < 0 && len(out.Items) == 1 {
+		pick = 0
+	}
+	if pick < 0 {
+		return "", errors.New("find a Silo profile: the API key's account has no primary profile")
+	}
+	p := out.Items[pick]
+	switch {
+	case p.ID == "":
+		return "", errors.New("find a Silo profile: Silo returned a profile with no id")
+	case p.HasPIN:
+		return "", fmt.Errorf("Silo profile %q has a PIN; use an admin API key whose account's primary profile has no PIN", p.Name)
+	case p.LibraryRestrictionsEnabled || p.MaxContentRating != "" || p.MaxAdvisoryAge != nil:
+		return "", fmt.Errorf("Silo profile %q has library or content restrictions, which could hide items from the revert; remove them or use another admin API key", p.Name)
+	}
+	s.profileID = p.ID
+	return p.ID, nil
 }
 
 // SetLockedFields replaces the item's locked fields (Silo stores the list

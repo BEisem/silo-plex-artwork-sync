@@ -1,6 +1,6 @@
 {
   "plugin_id": "community.kometa-sync",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "category": "Artwork",
